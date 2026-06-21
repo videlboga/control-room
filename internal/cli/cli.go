@@ -1,0 +1,448 @@
+package cli
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"syscall"
+	"time"
+
+	"github.com/spf13/cobra"
+	"control-room/internal/config"
+	"control-room/internal/project"
+	"control-room/internal/run"
+	"control-room/internal/store"
+	"control-room/internal/task"
+	"control-room/internal/team"
+)
+
+func NewRootCmd() *cobra.Command {
+	var root string
+	var hermesUser string
+	var hermesSource string
+	rootCmd := &cobra.Command{
+		Use:   "hw",
+		Short: "Hermes Workspace -- lightweight project/team/run orchestrator",
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			if root == "" {
+				root = "/home/cyberkitty/.control-room"
+			}
+			cfg, err := config.LoadOrCreate(root)
+			if err != nil {
+				return err
+			}
+			if hermesUser != "" {
+				cfg.HermesUser = hermesUser
+			}
+			if hermesSource != "" {
+				cfg.HermesSourceProfile = hermesSource
+			}
+			return nil
+		},
+	}
+	rootCmd.PersistentFlags().StringVarP(&root, "workspace", "w", "", "workspace root directory")
+	rootCmd.PersistentFlags().StringVar(&hermesUser, "hermes-user", "", "user that owns Hermes profiles")
+	rootCmd.PersistentFlags().StringVar(&hermesSource, "hermes-source", "", "default source Hermes profile to clone")
+
+	rootCmd.AddCommand(projectCmd())
+	rootCmd.AddCommand(teamCmd())
+	rootCmd.AddCommand(taskCmd())
+	rootCmd.AddCommand(runCmd())
+	return rootCmd
+}
+
+func projectCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "project", Short: "Manage projects"}
+
+	create := &cobra.Command{
+		Use:   "create",
+		Short: "Create a new project",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			id, _ := cmd.Flags().GetString("id")
+			title, _ := cmd.Flags().GetString("title")
+			repo, _ := cmd.Flags().GetString("repo")
+			team, _ := cmd.Flags().GetString("default-team")
+			docsDir, _ := cmd.Flags().GetString("docs-dir")
+			p := &project.Project{ID: id, Title: title, RepoPath: repo, DefaultTeam: team, DocsDir: docsDir}
+			if err := project.Create(st, p); err != nil {
+				return err
+			}
+			fmt.Printf("project %s created\n", id)
+			return nil
+		},
+	}
+	create.Flags().String("id", "", "project id")
+	create.Flags().String("title", "", "project title")
+	create.Flags().String("repo", "", "path to git repo")
+	create.Flags().String("default-team", "", "default team id")
+	create.Flags().String("docs-dir", "", "directory with project docs")
+	_ = create.MarkFlagRequired("id")
+	_ = create.MarkFlagRequired("title")
+
+	list := &cobra.Command{
+		Use:   "list",
+		Short: "List projects",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			projects, err := project.List(st)
+			if err != nil {
+				return err
+			}
+			for _, p := range projects {
+				fmt.Printf("%s\t%s\t%s\n", p.ID, p.Title, p.RepoPath)
+			}
+			return nil
+		},
+	}
+
+	show := &cobra.Command{
+		Use:   "show [id]",
+		Short: "Show project details",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			p, err := project.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			data, _ := json.MarshalIndent(p, "", "  ")
+			fmt.Println(string(data))
+			return nil
+		},
+	}
+
+	docs := &cobra.Command{Use: "docs", Short: "Manage project docs"}
+	addDoc := &cobra.Command{
+		Use:   "add",
+		Short: "Add a doc file to a project",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			projectID, _ := cmd.Flags().GetString("project")
+			file, _ := cmd.Flags().GetString("file")
+			if err := project.AddDoc(st, projectID, file); err != nil {
+				return err
+			}
+			fmt.Printf("added %s to project %s\n", file, projectID)
+			return nil
+		},
+	}
+	addDoc.Flags().String("project", "", "project id")
+	addDoc.Flags().String("file", "", "path to doc file")
+	_ = addDoc.MarkFlagRequired("project")
+	_ = addDoc.MarkFlagRequired("file")
+
+	listDocs := &cobra.Command{
+		Use:   "list",
+		Short: "List project docs",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			projectID, _ := cmd.Flags().GetString("project")
+			docs, err := project.ListDocs(st, projectID)
+			if err != nil {
+				return err
+			}
+			for _, d := range docs {
+				fmt.Println(d)
+			}
+			return nil
+		},
+	}
+	listDocs.Flags().String("project", "", "project id")
+	_ = listDocs.MarkFlagRequired("project")
+
+	docs.AddCommand(addDoc, listDocs)
+	cmd.AddCommand(create, list, show, docs)
+	return cmd
+}
+
+func teamCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "team", Short: "Manage teams"}
+
+	create := &cobra.Command{
+		Use:   "create",
+		Short: "Create a team from a JSON file",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			file, _ := cmd.Flags().GetString("file")
+			data, err := os.ReadFile(file)
+			if err != nil {
+				return err
+			}
+			var t team.Team
+			if err := json.Unmarshal(data, &t); err != nil {
+				return err
+			}
+			if err := team.Create(st, &t); err != nil {
+				return err
+			}
+			fmt.Printf("team %s created\n", t.ID)
+			return nil
+		},
+	}
+	create.Flags().String("file", "", "path to team JSON")
+	_ = create.MarkFlagRequired("file")
+
+	list := &cobra.Command{
+		Use:   "list",
+		Short: "List teams",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			teams, err := team.List(st)
+			if err != nil {
+				return err
+			}
+			for _, t := range teams {
+				fmt.Printf("%s\t%s\t%d agents\n", t.ID, t.Name, len(t.Agents))
+			}
+			return nil
+		},
+	}
+
+	show := &cobra.Command{
+		Use:   "show [id]",
+		Short: "Show team details",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			t, err := team.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			data, _ := json.MarshalIndent(t, "", "  ")
+			fmt.Println(string(data))
+			return nil
+		},
+	}
+
+	cmd.AddCommand(create, list, show)
+	return cmd
+}
+
+func taskCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "task", Short: "Manage tasks"}
+
+	create := &cobra.Command{
+		Use:   "create",
+		Short: "Create a new task",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			title, _ := cmd.Flags().GetString("title")
+			projectID, _ := cmd.Flags().GetString("project")
+			teamID, _ := cmd.Flags().GetString("team")
+			desc, _ := cmd.Flags().GetString("description")
+			priority, _ := cmd.Flags().GetString("priority")
+			t := &task.Task{Title: title, ProjectID: projectID, TeamID: teamID, Description: desc, Priority: priority}
+			created, err := task.Create(st, t)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("task %s created\n", created.ID)
+			return nil
+		},
+	}
+	create.Flags().String("title", "", "task title")
+	create.Flags().String("project", "", "project id")
+	create.Flags().String("team", "", "team id")
+	create.Flags().String("description", "", "task description")
+	create.Flags().String("priority", "normal", "task priority")
+	for _, f := range []string{"title", "project", "team"} {
+		_ = create.MarkFlagRequired(f)
+	}
+
+	list := &cobra.Command{
+		Use:   "list",
+		Short: "List tasks",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			projectID, _ := cmd.Flags().GetString("project")
+			tasks, err := task.ListByProject(st, projectID)
+			if err != nil {
+				return err
+			}
+			for _, t := range tasks {
+				fmt.Printf("%s\t%s\t%s\t%s\n", t.ID, t.Status, t.ProjectID, t.Title)
+			}
+			return nil
+		},
+	}
+	list.Flags().String("project", "", "filter by project id")
+
+	show := &cobra.Command{
+		Use:   "show [id]",
+		Short: "Show task details",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			t, err := task.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			data, _ := json.MarshalIndent(t, "", "  ")
+			fmt.Println(string(data))
+			return nil
+		},
+	}
+
+	cmd.AddCommand(create, list, show)
+	return cmd
+}
+
+func runCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "run", Short: "Manage runs"}
+
+	start := &cobra.Command{
+		Use:   "start --task [id]",
+		Short: "Start a run for a task (blocks until done; use --detach for background)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			taskID, _ := cmd.Flags().GetString("task")
+			detach, _ := cmd.Flags().GetBool("detach")
+			maxConcurrent, _ := cmd.Flags().GetInt("max-concurrent")
+			if detach {
+				return spawnDetached(cmd, taskID, maxConcurrent)
+			}
+			r, err := run.Start(st, taskID)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("run %s started for task %s\n", r.ID, taskID)
+			return run.WaitFor(st, r.ID, func(ev run.Event) {
+				ts := ev.Timestamp
+				if len(ts) > 19 {
+					ts = ts[:19]
+				}
+				fmt.Printf("[%s] %-10s %-10s %-10s %s\n", ts, ev.Agent, ev.Type, ev.Step, ev.Payload)
+			})
+		},
+	}
+	start.Flags().String("task", "", "task id")
+	start.Flags().Bool("detach", false, "detach and run in background")
+	start.Flags().Int("max-concurrent", 0, "override max concurrent runs limit")
+	_ = start.MarkFlagRequired("task")
+
+	list := &cobra.Command{
+		Use:   "list",
+		Short: "List runs",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			runs, err := run.List(st)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("%-20s %-12s %-12s %-12s %-20s\n", "ID", "STATUS", "AGENT", "STEP", "STARTED")
+			for _, r := range runs {
+				started := r.StartedAt
+				if len(started) > 19 {
+					started = started[:19]
+				}
+				fmt.Printf("%-20s %-12s %-12s %-12s %-20s\n", r.ID, r.Status, r.Agent, r.Step, started)
+			}
+			return nil
+		},
+	}
+
+	show := &cobra.Command{
+		Use:   "show [id]",
+		Short: "Show run details",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			r, err := run.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			data, _ := json.MarshalIndent(r, "", "  ")
+			fmt.Println(string(data))
+			return nil
+		},
+	}
+
+	logs := &cobra.Command{
+		Use:   "logs [id]",
+		Short: "Show run logs",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			events, err := run.Logs(st, args[0])
+			if err != nil {
+				return err
+			}
+			for _, ev := range events {
+				ts := ev.Timestamp
+				if len(ts) > 19 {
+					ts = ts[:19]
+				}
+				fmt.Printf("[%s] %-10s %-10s %-10s %s\n", ts, ev.Agent, ev.Type, ev.Step, ev.Payload)
+			}
+			return nil
+		},
+	}
+
+	cancel := &cobra.Command{
+		Use:   "cancel [id]",
+		Short: "Cancel a running run",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			if err := run.Cancel(st, args[0]); err != nil {
+				return err
+			}
+			fmt.Printf("run %s cancelled\n", args[0])
+			return nil
+		},
+	}
+
+	cmd.AddCommand(start, list, show, logs, cancel)
+	return cmd
+}
+
+func spawnDetached(cmd *cobra.Command, taskID string, maxConcurrent int) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	args := []string{"run", "start", "--task", taskID}
+	if root, err := cmd.Flags().GetString("workspace"); err == nil && root != "" {
+		args = append(args, "--workspace", root)
+	}
+	if maxConcurrent > 0 {
+		args = append(args, "--max-concurrent", fmt.Sprintf("%d", maxConcurrent))
+	}
+	c := exec.Command(self, args...)
+	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	if err := c.Start(); err != nil {
+		return err
+	}
+	fmt.Printf("run detached as pid %d for task %s\n", c.Process.Pid, taskID)
+	return nil
+}
+
+func storeFromFlags(cmd *cobra.Command) *store.Store {
+	root, _ := cmd.Flags().GetString("workspace")
+	if root == "" {
+		root = "/home/cyberkitty/.control-room"
+	}
+	cfg, _ := config.LoadOrCreate(root)
+	s := store.New(root)
+	if cfg != nil {
+		s.HermesUser = cfg.HermesUser
+		s.HermesSourceProfile = cfg.HermesSourceProfile
+		s.MaxConcurrentRuns = cfg.MaxConcurrentRuns
+	}
+	if user, err := cmd.Flags().GetString("hermes-user"); err == nil && user != "" {
+		s.HermesUser = user
+	}
+	if source, err := cmd.Flags().GetString("hermes-source"); err == nil && source != "" {
+		s.HermesSourceProfile = source
+	}
+	if max, err := cmd.Flags().GetInt("max-concurrent"); err == nil && max > 0 {
+		s.MaxConcurrentRuns = max
+	}
+	return s
+}
+
+var _ = time.Now
