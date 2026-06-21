@@ -16,6 +16,9 @@
 ## 🏗️ В работе / ближайшие задачи
 
 - [ ] Step timeout для зависших run'ов (сейчас 1 из 15 завис на review).
+  - **Сначала наблюдение:** собрать статистику по реальным run'ам — сколько времени занимает каждый шаг, какие шаги зависают, что делает hermes в этот момент.
+  - **Идея агента-наблюдателя:** лёгкий агент/скрипт, который читает `events.jsonl` долго выполняющихся run'ов и определяет, происходит ли в них что-то осмысленное (новые tool_call-события, прогресс в файловой системе, изменения git). Если активность есть — run считается живым и продолжает работать. Если активности нет N минут — помечать как stuck и предупреждать / убивать.
+  - Параметры: step timeout, run timeout, heartbeat interval — решить после наблюдений.
 - [ ] Worker node dispatch (SSH-based MVP):
   - [ ] node registry CRUD (`cr node add/list/remove`).
   - [ ] Scheduler выбирает ноду по available slots.
@@ -36,6 +39,7 @@
 - [ ] Per-team concurrency limit (не только глобальный).
 - [ ] Persist task transitions as events.
 - [ ] Graceful cancel — убивать hermes-процесс run'а, а не только менять статус.
+- [ ] Stuck-run observer agent: анализ events.jsonl + filesystem + git diff для определения «живой» vs «зависший» run.
 - [ ] Metrics endpoint (prometheus-style).
 - [ ] Tests.
 
