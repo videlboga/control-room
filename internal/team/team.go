@@ -39,8 +39,11 @@ func Create(st *store.Store, t *Team) error {
 	if t.CreatedAt == "" {
 		t.CreatedAt = time.Now().UTC().Format(time.RFC3339)
 	}
-	if err := ensureAgentProfiles(st, t); err != nil {
-		return err
+	// In stub mode we don't need real Hermes profiles.
+	if !st.StubMode {
+		if err := ensureAgentProfiles(st, t); err != nil {
+			return err
+		}
 	}
 	return st.WriteJSON([]string{"teams", t.ID + ".json"}, t)
 }
