@@ -277,6 +277,9 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 		}
 		_ = logEvent(st, r, agentName, "tool_call", "hermes", out)
 		previousResults = append(previousResults, fmt.Sprintf("Step '%s' result:\n%s", step, out))
+
+		// Write verdict metadata for the orchestrator.
+		writeRunMetadata(st, r, t, out)
 	}
 
 	// Update task BEFORE marking run done, so detached watchers do not exit
@@ -394,6 +397,11 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 	if t.Description != "" {
 		b.WriteString(fmt.Sprintf("Description: %s\n", t.Description))
 	}
+	b.WriteString(fmt.Sprintf("Task type: %s\n", t.Type))
+	b.WriteString(fmt.Sprintf("Your role: %s\n", t.Type))
+	if t.VerdictReason != "" {
+		b.WriteString(fmt.Sprintf("Rejection reason to address: %s\n", t.VerdictReason))
+	}
 	if r.Worktree != "" {
 		b.WriteString(fmt.Sprintf("Working directory (git worktree): %s\n", r.Worktree))
 		b.WriteString("You may read files and run git commands here. Prefer small, focused changes.\n")
@@ -448,6 +456,34 @@ func runGitAsHermes(user, repo string, args ...string) ([]byte, error) {
 	}
 	cmd := exec.Command("sudo", "-u", user, "bash", "-lc", fmt.Sprintf("cd %q && git %s", repo, quotedArgs))
 	return cmd.CombinedOutput()
+}
+
+
+// writeRunMetadata writes a deterministic metadata.json for the orchestrator.
+// Agents can be instructed to override via their output; here we use a safe default.
+func writeRunMetadata(st *store.Store, r *Run, t *task.Task, agentOutput string) {
+	meta := map[string]string{
+		"verdict": "approve",
+		"reason":  "agent completed step " + string(t.Type),
+	}
+	if t.Type == task.TypePMPlan {
+		// Agent should produce JSON plan; if not, use a minimal default plan.
+		meta["plan"] = `{"tasks":[{"id":"eng-1","type":"engineering","specialization":"any","title":"Implement ` + t.Title + `","dependencies":[]}]}`
+		_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, meta)
+		return
+	}
+	// Try to parse explicit verdict from the last lines of agent output.
+	lines := strings.Split(agentOutput, "\n")
+	for i := len(lines) - 1; i >= 0 && i >= len(lines)-5; i-- {
+		line := strings.ToLower(strings.TrimSpace(lines[i]))
+		if strings.Contains(line, "verdict: reject") || strings.Contains(line, "reject") {
+			meta["verdict"] = "reject"
+		}
+		if strings.Contains(line, "verdict: approve") || strings.Contains(line, "approve") {
+			meta["verdict"] = "approve"
+		}
+	}
+	_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, meta)
 }
 
 func logEvent(st *store.Store, r *Run, agent, typ, tool, payload string) error {

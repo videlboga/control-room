@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,11 +11,13 @@ import (
 
 	"github.com/spf13/cobra"
 	"control-room/internal/config"
+	"control-room/internal/epic"
 	"control-room/internal/project"
 	"control-room/internal/run"
 	"control-room/internal/store"
 	"control-room/internal/task"
 	"control-room/internal/team"
+	"control-room/internal/orchestrator"
 )
 
 func NewRootCmd() *cobra.Command {
@@ -46,8 +49,10 @@ func NewRootCmd() *cobra.Command {
 	rootCmd.PersistentFlags().StringVar(&hermesSource, "hermes-source", "", "default source Hermes profile to clone")
 
 	rootCmd.AddCommand(projectCmd())
+	rootCmd.AddCommand(epicCmd())
 	rootCmd.AddCommand(teamCmd())
 	rootCmd.AddCommand(taskCmd())
+	rootCmd.AddCommand(orchestrateCmd())
 	rootCmd.AddCommand(runCmd())
 	return rootCmd
 }
@@ -232,8 +237,14 @@ func taskCmd() *cobra.Command {
 			projectID, _ := cmd.Flags().GetString("project")
 			teamID, _ := cmd.Flags().GetString("team")
 			desc, _ := cmd.Flags().GetString("description")
-			priority, _ := cmd.Flags().GetString("priority")
-			t := &task.Task{Title: title, ProjectID: projectID, TeamID: teamID, Description: desc, Priority: priority}
+			typ, _ := cmd.Flags().GetString("type")
+			t := &task.Task{
+				Title:       title,
+				ProjectID:   projectID,
+				TeamID:      teamID,
+				Type:        task.TaskType(typ),
+				Description: desc,
+			}
 			created, err := task.Create(st, t)
 			if err != nil {
 				return err
@@ -246,8 +257,8 @@ func taskCmd() *cobra.Command {
 	create.Flags().String("project", "", "project id")
 	create.Flags().String("team", "", "team id")
 	create.Flags().String("description", "", "task description")
-	create.Flags().String("priority", "normal", "task priority")
-	for _, f := range []string{"title", "project", "team"} {
+	create.Flags().String("type", "engineering", "task type: research, qa_review, pm_plan, engineering, qa_verify, pm_consistency")
+	for _, f := range []string{"title", "project", "team", "type"} {
 		_ = create.MarkFlagRequired(f)
 	}
 
@@ -286,6 +297,102 @@ func taskCmd() *cobra.Command {
 	}
 
 	cmd.AddCommand(create, list, show)
+	return cmd
+}
+
+
+func epicCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "epic", Short: "Manage epics"}
+
+	create := &cobra.Command{
+		Use:   "create",
+		Short: "Create a new epic",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			title, _ := cmd.Flags().GetString("title")
+			projectID, _ := cmd.Flags().GetString("project")
+			desc, _ := cmd.Flags().GetString("description")
+			e := &epic.Epic{Title: title, ProjectID: projectID, Description: desc}
+			created, err := epic.Create(st, e)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("epic %s created\n", created.ID)
+			return nil
+		},
+	}
+	create.Flags().String("title", "", "epic title")
+	create.Flags().String("project", "", "project id")
+	create.Flags().String("description", "", "epic description")
+	_ = create.MarkFlagRequired("title")
+	_ = create.MarkFlagRequired("project")
+
+	list := &cobra.Command{
+		Use:   "list",
+		Short: "List epics",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			epics, err := epic.List(st)
+			if err != nil {
+				return err
+			}
+			for _, e := range epics {
+				fmt.Printf("%s\t%s\t%s\t%s\n", e.ID, e.Status, e.ProjectID, e.Title)
+			}
+			return nil
+		},
+	}
+
+	show := &cobra.Command{
+		Use:   "show [id]",
+		Short: "Show epic details",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			e, err := epic.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			data, _ := json.MarshalIndent(e, "", "  ")
+			fmt.Println(string(data))
+			return nil
+		},
+	}
+
+	cmd.AddCommand(create, list, show)
+	return cmd
+}
+
+
+func orchestrateCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "orchestrate",
+		Short: "Run the deterministic workflow orchestrator for an epic",
+	}
+
+	run := &cobra.Command{
+		Use:   "run",
+		Short: "Start orchestrating an epic",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			epicID, _ := cmd.Flags().GetString("epic")
+			if epicID == "" {
+				return errors.New("--epic is required")
+			}
+			o := orchestrator.Orchestrator{Store: st}
+			return o.RunEpic(epicID, func(event string, args ...interface{}) {
+				fmt.Printf("[orch] %s", event)
+				for _, a := range args {
+					fmt.Printf(" %v", a)
+				}
+				fmt.Println()
+			})
+		},
+	}
+	run.Flags().String("epic", "", "epic id")
+	_ = run.MarkFlagRequired("epic")
+
+	cmd.AddCommand(run)
 	return cmd
 }
 

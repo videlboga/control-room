@@ -18,6 +18,8 @@ type Project struct {
 	Docs        []string `json:"docs" yaml:"docs"`
 	DefaultTeam string   `json:"default_team" yaml:"default_team"`
 	Rules       []string `json:"rules" yaml:"rules"`
+	TestCommand string   `json:"test_command,omitempty" yaml:"test_command,omitempty"`
+	LintCommand string   `json:"lint_command,omitempty" yaml:"lint_command,omitempty"`
 	CreatedAt   string   `json:"created_at" yaml:"created_at"`
 }
 
