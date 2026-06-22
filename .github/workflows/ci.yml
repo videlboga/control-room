@@ -19,7 +19,7 @@ jobs:
           go-version: '1.23'
 
       - name: Build CLI
-        run: go build -buildvcs=false -o /tmp/cr ./cmd/cr
+        run: go build -buildvcs=false -o ./cr ./cmd/cr
 
       - name: Run unit tests
         run: go test -buildvcs=false -race -count=1 ./...
@@ -34,5 +34,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cr-binary
-          path: /tmp/cr
+          path: ./cr
           if-no-files-found: error
