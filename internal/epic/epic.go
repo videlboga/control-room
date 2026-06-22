@@ -15,6 +15,7 @@ type Epic struct {
 	Title       string `json:"title" yaml:"title"`
 	Description string `json:"description,omitempty" yaml:"description,omitempty"`
 	ProjectID   string `json:"project_id" yaml:"project_id"`
+	TeamID      string `json:"team_id,omitempty" yaml:"team_id,omitempty"`
 	Status      string `json:"status" yaml:"status"`
 	CreatedAt   string `json:"created_at" yaml:"created_at"`
 }

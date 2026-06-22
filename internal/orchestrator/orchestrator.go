@@ -560,9 +560,33 @@ func (o *Orchestrator) expandEngineering(pmTask *task.Task) error {
 	if err != nil {
 		return err
 	}
+
+	// Support both {"plan": {"tasks": [...]}} and {"plan": [...]} shapes.
+	var wrapper struct {
+		Plan json.RawMessage `json:"plan"`
+	}
+	if err := json.Unmarshal([]byte(planData), &wrapper); err != nil {
+		return fmt.Errorf("invalid plan JSON wrapper: %w", err)
+	}
+	var rawTasks json.RawMessage
+	if len(wrapper.Plan) > 0 {
+		if wrapper.Plan[0] == '[' {
+			rawTasks = wrapper.Plan
+		} else {
+			var taskWrapper struct {
+				Tasks json.RawMessage `json:"tasks"`
+			}
+			if err := json.Unmarshal(wrapper.Plan, &taskWrapper); err == nil {
+				rawTasks = taskWrapper.Tasks
+			}
+		}
+	}
+	if rawTasks == nil {
+		return errors.New("plan metadata missing tasks array")
+	}
 	var plan Plan
-	if err := json.Unmarshal([]byte(planData), &plan); err != nil {
-		return fmt.Errorf("invalid plan JSON: %w", err)
+	if err := json.Unmarshal(rawTasks, &plan.Tasks); err != nil {
+		return fmt.Errorf("invalid plan tasks JSON: %w", err)
 	}
 
 	if err := validatePlan(&plan); err != nil {

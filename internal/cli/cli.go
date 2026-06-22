@@ -325,8 +325,15 @@ func epicCmd() *cobra.Command {
 			st := storeFromFlags(cmd)
 			title, _ := cmd.Flags().GetString("title")
 			projectID, _ := cmd.Flags().GetString("project")
+			teamID, _ := cmd.Flags().GetString("team")
 			desc, _ := cmd.Flags().GetString("description")
-			e := &epic.Epic{Title: title, ProjectID: projectID, Description: desc}
+			if teamID == "" {
+				proj, err := project.Get(st, projectID)
+				if err == nil {
+					teamID = proj.DefaultTeam
+				}
+			}
+			e := &epic.Epic{Title: title, ProjectID: projectID, TeamID: teamID, Description: desc}
 			created, err := epic.Create(st, e)
 			if err != nil {
 				return err
@@ -337,6 +344,7 @@ func epicCmd() *cobra.Command {
 	}
 	create.Flags().String("title", "", "epic title")
 	create.Flags().String("project", "", "project id")
+	create.Flags().String("team", "", "team id (optional, defaults to project default team)")
 	create.Flags().String("description", "", "epic description")
 	_ = create.MarkFlagRequired("title")
 	_ = create.MarkFlagRequired("project")

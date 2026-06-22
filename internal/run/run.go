@@ -251,9 +251,15 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 		return
 	}
 
-	steps := []string{"plan", "implement", "review", "finalize"}
-	if len(te.Workflow) > 0 {
-		steps = te.Workflow
+	step, agentName, profile := stepForTaskType(t, te)
+	if step == "" {
+		step = "implement"
+	}
+	if profile == "" {
+		profile = defaultProfileForStep(step)
+	}
+	if agentName == "" {
+		agentName = defaultAgentName(te)
 	}
 
 	user := st.HermesUser
@@ -261,31 +267,20 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 		user = "cyberkitty"
 	}
 
-	var previousResults []string
-	for i, step := range steps {
-		agentName, profile := te.AgentForStep(step)
-		if profile == "" {
-			profile = defaultProfileForStep(step)
-		}
-		r.Agent = agentName
-		r.Step = step
-		_ = logEvent(st, r, agentName, "step", "", step)
+	r.Agent = agentName
+	r.Step = step
+	_ = logEvent(st, r, agentName, "step", "", step)
+	_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
+
+	prompt := buildPrompt(st, r, t, p, te, step, 0, nil)
+	out, err := runHermes(user, profile, prompt, r.Worktree)
+	if err != nil {
+		r.Errors++
+		_ = logEvent(st, r, agentName, "error", "hermes", err.Error())
 		_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
-
-		prompt := buildPrompt(st, r, t, p, te, step, i, previousResults)
-		out, err := runHermes(user, profile, prompt, r.Worktree)
-		if err != nil {
-			r.Errors++
-			_ = logEvent(st, r, agentName, "error", "hermes", err.Error())
-			_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
-			continue
-		}
-		_ = logEvent(st, r, agentName, "tool_call", "hermes", out)
-		previousResults = append(previousResults, fmt.Sprintf("Step '%s' result:\n%s", step, out))
-
-		// Write verdict metadata for the orchestrator.
-		writeRunMetadata(st, r, t, out)
 	}
+	_ = logEvent(st, r, agentName, "tool_call", "hermes", out)
+	writeRunMetadata(st, r, t, out)
 
 	// Update task BEFORE marking run done, so detached watchers do not exit
 	// before the task status is persisted.
@@ -299,6 +294,38 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 	_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
 
 	_ = releaseSlot(st, slot)
+}
+
+// stepForTaskType maps an orchestrator task type to a single team workflow step
+// and the agent that should execute it.
+func stepForTaskType(t *task.Task, te *team.Team) (string, string, string) {
+	switch t.Type {
+	case task.TypeResearch:
+		name, profile := te.AgentForStep("research")
+		return "research", name, profile
+	case task.TypeQAReview:
+		name, profile := te.AgentForStep("review")
+		if name == "" {
+			name, profile = te.AgentForStep("verify")
+		}
+		return "review", name, profile
+	case task.TypePMPlan:
+		name, profile := te.AgentForStep("plan")
+		return "plan", name, profile
+	case task.TypeEngineering:
+		name, profile := te.AgentForStep("implement")
+		return "implement", name, profile
+	case task.TypeQAVerify:
+		name, profile := te.AgentForStep("verify")
+		return "verify", name, profile
+	case task.TypePMConsistency:
+		name, profile := te.AgentForStep("review")
+		if name == "" {
+			name, profile = te.AgentForStep("verify")
+		}
+		return "review", name, profile
+	}
+	return "", "", ""
 }
 
 // stubPlan mirrors the orchestrator Plan shape without importing the orchestrator
@@ -496,13 +523,16 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 		b.WriteString(fmt.Sprintf("Description: %s\n", t.Description))
 	}
 	b.WriteString(fmt.Sprintf("Task type: %s\n", t.Type))
-	b.WriteString(fmt.Sprintf("Your role: %s\n", t.Type))
+	b.WriteString(fmt.Sprintf("Your role: %s\n", step))
 	if t.Type == task.TypePMPlan {
 		b.WriteString("\nAs the PM planner, produce a detailed implementation plan. " +
-			"At the end of your response, include a JSON object under the key 'plan' " +
-			"with an array of engineering tasks, each having id, type='engineering', " +
-			"specialization, title, optional description, and dependencies (ids of tasks it depends on). " +
-			"Example: {\"plan\":{\"tasks\":[{\"id\":\"eng-core\",\"type\":\"engineering\",\"specialization\":\"backend\",\"title\":\"Implement core\",\"dependencies\":[]}]}}\n")
+			"Write the plan as compact JSON to the file docs/plan.json in the working directory. " +
+			"The JSON must be under the key 'plan' with an array of engineering tasks. " +
+			"Each task: id, type='engineering', specialization, title, optional description, dependencies (array of ids). " +
+			"The JSON must be compact (single line), with no literal newlines inside string values — use \\n escapes if needed. " +
+			"After writing the file, report a concise summary of what you did.\n\n" +
+			"Example contents of docs/plan.json:\n" +
+			"{\"plan\":{\"tasks\":[{\"id\":\"eng-core\",\"type\":\"engineering\",\"specialization\":\"backend\",\"title\":\"Implement core\",\"dependencies\":[]}]}}\n")
 	}
 	if t.VerdictReason != "" {
 		b.WriteString(fmt.Sprintf("Rejection reason to address: %s\n", t.VerdictReason))
@@ -588,9 +618,14 @@ func writeRunMetadata(st *store.Store, r *Run, t *task.Task, agentOutput string)
 		"reason":  "agent completed step " + string(t.Type),
 	}
 	if t.Type == task.TypePMPlan {
-		// Agent must produce a valid plan JSON. If it cannot be found in the output,
-		// the orchestrator will reject this PM plan task during expansion.
-		meta["plan"] = extractPlanJSON(agentOutput)
+		planJSON, ok := extractPlanJSON(agentOutput, r.Worktree)
+		if !ok || planJSON == "" {
+			meta["verdict"] = "reject"
+			meta["reason"] = "PM plan did not produce a valid JSON plan with tasks/dependencies"
+			meta["plan"] = `{"plan":{"tasks":[]}}`
+		} else {
+			meta["plan"] = planJSON
+		}
 		_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, meta)
 		return
 	}
@@ -609,23 +644,71 @@ func writeRunMetadata(st *store.Store, r *Run, t *task.Task, agentOutput string)
 }
 
 // extractPlanJSON finds the last JSON object in the agent output that contains a "plan" key.
-// It returns an empty plan only if no such object is found.
-func extractPlanJSON(output string) string {
+// It also tries to read docs/plan.json from the worktree if the output extraction fails.
+// It returns the extracted JSON and true if a valid plan object was found.
+func extractPlanJSON(output, worktree string) (string, bool) {
+	// Prefer a dedicated plan file written by the PM agent.
+	if worktree != "" {
+		planPath := filepath.Join(worktree, "docs", "plan.json")
+		if data, err := os.ReadFile(planPath); err == nil {
+			if s, ok := normalizePlanJSON(string(data)); ok {
+				return s, true
+			}
+		}
+	}
+	// Try to extract JSON from a markdown code block.
+	if idx := strings.LastIndex(output, "```json"); idx != -1 {
+		block := output[idx+len("```json"):]
+		if end := strings.Index(block, "```"); end != -1 {
+			candidate := strings.TrimSpace(block[:end])
+			if s, ok := normalizePlanJSON(candidate); ok {
+				return s, true
+			}
+		}
+	}
+	// Fallback: scan for the last JSON object containing "plan".
 	start := strings.LastIndex(output, `{"plan"`)
 	if start == -1 {
 		start = strings.LastIndex(output, `{"tasks"`)
 	}
 	if start == -1 {
-		return `{"plan":{"tasks":[]}}`
+		return "", false
 	}
-	end := strings.Index(output[start:], "}\n")
+	depth := 0
+	end := -1
+	for i := start; i < len(output); i++ {
+		c := output[i]
+		if c == '{' {
+			depth++
+		} else if c == '}' {
+			depth--
+			if depth == 0 {
+				end = i
+				break
+			}
+		}
+	}
 	if end == -1 {
-		end = strings.Index(output[start:], "}\r\n")
+		return "", false
 	}
-	if end == -1 {
-		return output[start:]
+	return normalizePlanJSON(output[start : end+1])
+}
+
+// normalizePlanJSON validates and minifies a plan JSON object. It accepts both
+// {"plan": {"tasks": [...]}} and {"plan": [...]} shapes.
+func normalizePlanJSON(s string) (string, bool) {
+	// Remove literal newlines inside JSON string values that were not escaped.
+	s = strings.ReplaceAll(s, "\r\n", "\\n")
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	var v map[string]any
+	if err := json.Unmarshal([]byte(s), &v); err != nil {
+		return "", false
 	}
-	return output[start : start+end+1]
+	if _, ok := v["plan"]; !ok && v["tasks"] == nil {
+		return "", false
+	}
+	compact, _ := json.Marshal(v)
+	return string(compact), true
 }
 
 func logEvent(st *store.Store, r *Run, agent, typ, tool, payload string) error {

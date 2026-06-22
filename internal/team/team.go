@@ -71,17 +71,28 @@ func List(st *store.Store) ([]Team, error) {
 
 // AgentForStep returns the agent name and profile (if set) for a workflow step.
 func (t *Team) AgentForStep(step string) (string, string) {
-	// Explicit mapping by role name matching the step.
 	switch step {
-	case "review":
+	case "research":
 		for name, ref := range t.Agents {
-			if ref.Role == "reviewer" {
+			if ref.Role == "researcher" {
 				return name, ref.Profile
 			}
 		}
-	case "plan", "implement":
+	case "plan":
 		for name, ref := range t.Agents {
-			if ref.Role == "worker" || ref.Role == "coder" || ref.Role == "lead" {
+			if ref.Role == "pm" || ref.Role == "lead" {
+				return name, ref.Profile
+			}
+		}
+	case "implement":
+		for name, ref := range t.Agents {
+			if ref.Role == "worker" || ref.Role == "coder" || ref.Role == "engineer" {
+				return name, ref.Profile
+			}
+		}
+	case "review", "verify":
+		for name, ref := range t.Agents {
+			if ref.Role == "reviewer" || ref.Role == "qa" {
 				return name, ref.Profile
 			}
 		}
