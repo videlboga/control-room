@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
+
+	"golang.org/x/sys/unix"
 	"io"
 	"os"
 	"os/exec"
@@ -279,7 +282,7 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 	_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
 
 	prompt := buildPrompt(st, r, t, p, te, step, 0, nil)
-	out, err := runHermes(user, profile, prompt, r.Worktree)
+	out, err := runHermes(user, profile, prompt, r.Worktree, filepath.Join(st.Root, "runs", r.ID, "activity.log"))
 	if err != nil {
 		r.Errors++
 		_ = logEvent(st, r, agentName, "error", "hermes", err.Error())
@@ -428,7 +431,14 @@ func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 	_ = releaseSlot(st, slot)
 }
 
+// isProcessAlive checks whether a PID is still running on Linux.
+func isProcessAlive(pid int) bool {
+	return unix.Kill(pid, 0) == nil
+}
+
 // acquireSlot claims one of N filesystem slots; returns the slot number (1..N).
+// It reclaims locks held by dead processes so crashes do not permanently
+// exhaust the concurrency pool.
 func acquireSlot(st *store.Store, max int) (int, error) {
 	if max <= 0 {
 		max = config.DefaultMaxConcurrentRuns
@@ -445,6 +455,19 @@ func acquireSlot(st *store.Store, max int) (int, error) {
 				_ = f.Close()
 				return i, nil
 			}
+			// Lock exists: check if owner is alive.
+			data, _ := os.ReadFile(path)
+			var pid int
+			fmt.Sscanf(string(data), "%d", &pid)
+			if pid > 0 && !isProcessAlive(pid) {
+				_ = os.Remove(path)
+				f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+				if err == nil {
+					_, _ = f.WriteString(fmt.Sprintf("%d\n", os.Getpid()))
+					_ = f.Close()
+					return i, nil
+				}
+			}
 		}
 		time.Sleep(3 * time.Second)
 	}
@@ -456,7 +479,28 @@ func releaseSlot(st *store.Store, slot int) error {
 	return os.Remove(path)
 }
 
-func runHermes(user, profile, prompt, worktree string) (string, error) {
+// activityWriter appends heartbeat messages to a file so watchers can verify
+// the agent is still making progress instead of relying on a wall-clock timeout.
+type activityWriter struct {
+	path string
+	mu   sync.Mutex
+}
+
+func (a *activityWriter) write(format string, args ...interface{}) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "[%s] "+format+"\n", append([]interface{}{time.Now().UTC().Format(time.RFC3339)}, args...)...)
+}
+
+func runHermes(user, profile, prompt, worktree, activityPath string) (string, error) {
+	act := &activityWriter{path: activityPath}
+	act.write("start profile=%s worktree=%s", profile, worktree)
+
 	args := []string{
 		"--profile", profile,
 		"chat", "-q", prompt,
@@ -476,11 +520,77 @@ func runHermes(user, profile, prompt, worktree string) (string, error) {
 	} else {
 		cmd = exec.Command("sudo", "-u", user, "bash", "-lc", fmt.Sprintf("hermes %s", quotedArgs))
 	}
-	out, err := cmd.CombinedOutput()
+
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return string(out), fmt.Errorf("hermes exited: %w\n%s", err, out)
+		return "", fmt.Errorf("stdout pipe: %w", err)
 	}
-	return cleanHermesOutput(string(out)), nil
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return "", fmt.Errorf("stderr pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("start hermes: %w", err)
+	}
+
+	var wg sync.WaitGroup
+	var outBuf strings.Builder
+	var outMu sync.Mutex
+	tee := func(r io.Reader) {
+		defer wg.Done()
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			line := scanner.Text()
+			outMu.Lock()
+			outBuf.WriteString(line)
+			outBuf.WriteByte('\n')
+			outMu.Unlock()
+			act.write("line")
+		}
+	}
+	wg.Add(2)
+	go tee(stdout)
+	go tee(stderr)
+
+	// Watchdog: if the agent stops producing output for 3 minutes, kill the process.
+	// Hermes tool calls already have their own timeouts; this catches a truly stuck
+	// process rather than imposing a wall-clock limit on the whole run.
+	done := make(chan struct{})
+	go monitorHermesActivity(cmd, activityPath, 3*time.Minute, done)
+
+	err = cmd.Wait()
+	close(done)
+	wg.Wait()
+	act.write("done err=%v out_bytes=%d", err, outBuf.Len())
+	if err != nil {
+		return cleanHermesOutput(outBuf.String()), fmt.Errorf("hermes exited: %w\n%s", err, outBuf.String())
+	}
+	return cleanHermesOutput(outBuf.String()), nil
+}
+
+// monitorHermesActivity polls the activity log mtime. If it has not changed for
+// longer than staleThreshold and the process is still running, it kills the process.
+func monitorHermesActivity(cmd *exec.Cmd, activityPath string, staleThreshold time.Duration, done <-chan struct{}) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	lastMtime := time.Now()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			info, err := os.Stat(activityPath)
+			if err == nil && info.ModTime().After(lastMtime) {
+				lastMtime = info.ModTime()
+			}
+			if time.Since(lastMtime) > staleThreshold {
+				if cmd.Process != nil {
+					_ = cmd.Process.Kill()
+				}
+				return
+			}
+		}
+	}
 }
 
 func truncate(s string, n int) string {
