@@ -4,20 +4,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"control-room/internal/config"
 	"control-room/internal/epic"
+	"control-room/internal/orchestrator"
 	"control-room/internal/project"
 	"control-room/internal/run"
 	"control-room/internal/store"
 	"control-room/internal/task"
 	"control-room/internal/team"
-	"control-room/internal/orchestrator"
 )
 
 func NewRootCmd() *cobra.Command {
@@ -388,10 +390,14 @@ func orchestrateCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			st := storeFromFlags(cmd)
 			epicID, _ := cmd.Flags().GetString("epic")
+			manual, _ := cmd.Flags().GetBool("manual-approve")
 			if epicID == "" {
 				return errors.New("--epic is required")
 			}
-			o := orchestrator.Orchestrator{Store: st}
+			o := orchestrator.Orchestrator{Store: st, ManualApprove: manual}
+			if manual {
+				o.Prompt = manualApprovePrompt(cmd.InOrStdin(), cmd.OutOrStdout())
+			}
 			return o.RunEpic(epicID, func(event string, args ...interface{}) {
 				fmt.Printf("[orch] %s", event)
 				for _, a := range args {
@@ -402,10 +408,27 @@ func orchestrateCmd() *cobra.Command {
 		},
 	}
 	run.Flags().String("epic", "", "epic id")
+	run.Flags().Bool("manual-approve", false, "prompt for manual approval on QA verify tasks")
 	_ = run.MarkFlagRequired("epic")
 
 	cmd.AddCommand(run)
 	return cmd
+}
+
+func manualApprovePrompt(in io.Reader, out io.Writer) func(string) (string, string) {
+	return func(taskID string) (string, string) {
+		fmt.Fprintf(out, "Approve QA verify task %s? [approve/reject]: ", taskID)
+		var line string
+		_, _ = fmt.Fscanln(in, &line)
+		line = strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(line, "rej") {
+			return "reject", "manual rejection"
+		}
+		if line == "" || strings.HasPrefix(line, "app") {
+			return "approve", "manual approval"
+		}
+		return "reject", fmt.Sprintf("unrecognized response %q, defaulting to reject", line)
+	}
 }
 
 func runCmd() *cobra.Command {

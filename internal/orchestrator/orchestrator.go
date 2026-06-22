@@ -22,7 +22,11 @@ import (
 // It is intentionally small and hard to fool: transitions are hard-coded,
 // LLM agents only generate content inside each step.
 type Orchestrator struct {
-	Store *store.Store
+	Store         *store.Store
+	ManualApprove bool
+	// Prompt is called when ManualApprove is true and a QA verify task finishes.
+	// It should return "approve" or "reject" and an optional reason.
+	Prompt func(taskID string) (verdict string, reason string)
 }
 
 // Plan is the decomposition produced by the PM agent.
@@ -139,6 +143,15 @@ func (o *Orchestrator) RunEpic(epicID string, cb func(string, ...interface{})) e
 			// Treat missing/invalid verdict as reject.
 			verdict = "reject"
 			reason = "no valid verdict in run metadata: " + verdictErr.Error()
+		}
+
+		// 3.5 Human-in-the-loop override for QA verify.
+		if o.ManualApprove && ready.Type == task.TypeQAVerify && verdict == "approve" {
+			if o.Prompt != nil {
+				cb("awaiting_manual_approval", ready.ID)
+				verdict, reason = o.Prompt(ready.ID)
+				cb("manual_verdict", ready.ID, verdict, reason)
+			}
 		}
 
 		ready.Status = task.StatusPendingReview
