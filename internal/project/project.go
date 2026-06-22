@@ -2,7 +2,9 @@ package project
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -40,7 +42,24 @@ func Create(st *store.Store, p *Project) error {
 	if p.CreatedAt == "" {
 		p.CreatedAt = time.Now().UTC().Format(time.RFC3339)
 	}
+	// Ensure the backing repo has a valid HEAD so that git worktrees can branch from it.
+	if p.RepoPath != "" {
+		if err := ensureRepoHasCommit(p.RepoPath); err != nil {
+			return fmt.Errorf("repo setup failed: %w", err)
+		}
+	}
 	return st.WriteJSON([]string{"projects", p.ID + ".json"}, p)
+}
+
+// ensureRepoHasCommit creates an empty initial commit if the repo has no commits yet.
+func ensureRepoHasCommit(repoPath string) error {
+	cmd := exec.Command("git", "-C", repoPath, "rev-parse", "--verify", "HEAD")
+	if err := cmd.Run(); err == nil {
+		return nil
+	}
+	_ = exec.Command("git", "-C", repoPath, "config", "user.email", "hw@hermes.local").Run()
+	_ = exec.Command("git", "-C", repoPath, "config", "user.name", "Hermes Workspace").Run()
+	return exec.Command("git", "-C", repoPath, "commit", "--allow-empty", "-m", "chore: initial commit").Run()
 }
 
 func Get(st *store.Store, id string) (*Project, error) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -25,6 +26,7 @@ import (
 type Orchestrator struct {
 	Store         *store.Store
 	ManualApprove bool
+	MaxRedo       int
 	// Prompt is called when ManualApprove is true and a QA verify task finishes.
 	// It should return "approve" or "reject" and an optional reason.
 	Prompt func(taskID string) (verdict string, reason string)
@@ -192,6 +194,22 @@ func (o *Orchestrator) RunEpic(epicID string, cb func(string, ...interface{})) e
 			}
 
 			nextType := transitions[ready.Type]["approved"]
+			if ready.Type == task.TypeResearch {
+				if err := o.copyResearchDoc(ready); err != nil {
+					cb("research_doc_error", ready.ID, err)
+				}
+			}
+			if ready.Type == task.TypePMPlan {
+				if err := o.copyPlanDoc(ready); err != nil {
+					cb("plan_doc_error", ready.ID, err)
+				}
+			}
+			if ready.Type == task.TypeEngineering {
+				if err := o.mergeEngineeringWorktree(ready); err != nil {
+					cb("merge_error", ready.ID, err)
+				}
+			}
+
 			if nextType == "" || nextType == task.TypeQAVerify {
 				// Engineering approved: the orchestrator already created a single QA verify
 				// task that depends on all engineering tasks. No new task is created here.
@@ -378,6 +396,21 @@ func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{}))
 				}
 
 				nextType := transitions[ready.Type]["approved"]
+				if ready.Type == task.TypeResearch {
+					if err := o.copyResearchDoc(ready); err != nil {
+						cb("research_doc_error", ready.ID, err)
+					}
+				}
+				if ready.Type == task.TypePMPlan {
+					if err := o.copyPlanDoc(ready); err != nil {
+						cb("plan_doc_error", ready.ID, err)
+					}
+				}
+				if ready.Type == task.TypeEngineering {
+					if err := o.mergeEngineeringWorktree(ready); err != nil {
+						cb("merge_error", ready.ID, err)
+					}
+				}
 				if nextType == "" || nextType == task.TypeQAVerify {
 					cb("task_done", ready.ID)
 					continue
@@ -402,6 +435,15 @@ func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{}))
 			} else {
 				ready.Status = task.StatusRejected
 				_ = task.Update(o.Store, ready)
+
+				maxRedo := o.MaxRedo
+				if maxRedo <= 0 {
+					maxRedo = 3
+				}
+				if ready.RedoIndex >= maxRedo {
+					cb("task_failed", ready.ID, "max redo attempts reached")
+					continue
+				}
 
 				redoType := transitions[ready.Type]["rejected"]
 				if redoType == "" {
@@ -539,7 +581,82 @@ func (o *Orchestrator) nextTitle(tt task.TaskType, prev *task.Task) string {
 	}
 }
 
+// copyPlanDoc copies docs/plan.json from the PM plan worktree into project docs
+// so that engineering agents can read it alongside RESEARCH.md.
+func (o *Orchestrator) copyPlanDoc(pmTask *task.Task) error {
+	proj, err := project.Get(o.Store, pmTask.ProjectID)
+	if err != nil {
+		return err
+	}
+	runs, err := run.ListByTask(o.Store, pmTask.ID)
+	if err != nil || len(runs) == 0 {
+		return errors.New("no run for PM plan task")
+	}
+	wt := runs[0].Worktree
+	if wt == "" {
+		return errors.New("PM plan run has no worktree")
+	}
+	src := filepath.Join(wt, "docs", "plan.json")
+	if _, err := os.Stat(src); err != nil {
+		return fmt.Errorf("docs/plan.json not found in worktree: %w", err)
+	}
+	if err := project.AddDoc(o.Store, proj.ID, src); err != nil {
+		return fmt.Errorf("AddDoc failed for plan.json: %w", err)
+	}
+	return nil
+}
+
 // expandEngineering reads the PM plan output, validates it, and creates engineering tasks.
+// copyResearchDoc copies RESEARCH.md from the research worktree into project docs
+// so that downstream agents (PM plan, engineering) can read it as a source of truth.
+func (o *Orchestrator) copyResearchDoc(researchTask *task.Task) error {
+	proj, err := project.Get(o.Store, researchTask.ProjectID)
+	if err != nil {
+		return err
+	}
+	runs, err := run.ListByTask(o.Store, researchTask.ID)
+	if err != nil || len(runs) == 0 {
+		return errors.New("no run for research task")
+	}
+	wt := runs[0].Worktree
+	if wt == "" {
+		return errors.New("research run has no worktree")
+	}
+	src := filepath.Join(wt, "RESEARCH.md")
+	if _, err := os.Stat(src); err != nil {
+		return fmt.Errorf("RESEARCH.md not found in worktree: %w", err)
+	}
+	if err := project.AddDoc(o.Store, proj.ID, src); err != nil {
+		return fmt.Errorf("AddDoc failed: %w", err)
+	}
+	return nil
+}
+
+// mergeEngineeringWorktree merges the approved engineering worktree branch back into
+// the project's main repo so that subsequent engineering tasks inherit the state.
+func (o *Orchestrator) mergeEngineeringWorktree(t *task.Task) error {
+	proj, err := project.Get(o.Store, t.ProjectID)
+	if err != nil {
+		return err
+	}
+	if proj.RepoPath == "" {
+		return nil
+	}
+	runs, err := run.ListByTask(o.Store, t.ID)
+	if err != nil || len(runs) == 0 {
+		return errors.New("no run for engineering task")
+	}
+	r := runs[0]
+	if r.Branch == "" || r.Worktree == "" {
+		return nil
+	}
+	// Ensure worktree commits are on top of current main.
+	if out, err := exec.Command("git", "-C", proj.RepoPath, "merge", "-Xtheirs", "-m", "merge "+t.ID, r.Branch).CombinedOutput(); err != nil {
+		return fmt.Errorf("merge failed: %w\n%s", err, out)
+	}
+	return nil
+}
+
 func (o *Orchestrator) expandEngineering(pmTask *task.Task) error {
 	e, err := epic.Get(o.Store, pmTask.EpicID)
 	if err != nil {
@@ -644,12 +761,12 @@ func (o *Orchestrator) expandEngineering(pmTask *task.Task) error {
 	}
 	if len(engIDs) > 0 {
 		_, err = task.Create(o.Store, &task.Task{
-			Title:       "QA verify: " + e.Title,
-			Type:        task.TypeQAVerify,
-			ProjectID:   e.ProjectID,
-			EpicID:      e.ID,
-			ParentID:    pmTask.ID,
-			TeamID:      pmTask.TeamID,
+			Title:        "QA verify: " + e.Title,
+			Type:         task.TypeQAVerify,
+			ProjectID:    e.ProjectID,
+			EpicID:       e.ID,
+			ParentID:     pmTask.ID,
+			TeamID:       pmTask.TeamID,
 			Dependencies: engIDs,
 		})
 		if err != nil {
@@ -758,4 +875,3 @@ func ExpandEpic(st *store.Store, epicID string) error {
 	o := &Orchestrator{Store: st}
 	return o.RunEpic(epicID, func(event string, args ...interface{}) {})
 }
-
