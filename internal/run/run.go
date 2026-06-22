@@ -497,6 +497,13 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 	}
 	b.WriteString(fmt.Sprintf("Task type: %s\n", t.Type))
 	b.WriteString(fmt.Sprintf("Your role: %s\n", t.Type))
+	if t.Type == task.TypePMPlan {
+		b.WriteString("\nAs the PM planner, produce a detailed implementation plan. " +
+			"At the end of your response, include a JSON object under the key 'plan' " +
+			"with an array of engineering tasks, each having id, type='engineering', " +
+			"specialization, title, optional description, and dependencies (ids of tasks it depends on). " +
+			"Example: {\"plan\":{\"tasks\":[{\"id\":\"eng-core\",\"type\":\"engineering\",\"specialization\":\"backend\",\"title\":\"Implement core\",\"dependencies\":[]}]}}\n")
+	}
 	if t.VerdictReason != "" {
 		b.WriteString(fmt.Sprintf("Rejection reason to address: %s\n", t.VerdictReason))
 	}
@@ -581,8 +588,9 @@ func writeRunMetadata(st *store.Store, r *Run, t *task.Task, agentOutput string)
 		"reason":  "agent completed step " + string(t.Type),
 	}
 	if t.Type == task.TypePMPlan {
-		// Agent should produce JSON plan; if not, use a minimal default plan.
-		meta["plan"] = `{"tasks":[{"id":"eng-1","type":"engineering","specialization":"any","title":"Implement ` + t.Title + `","dependencies":[]}]}`
+		// Agent must produce a valid plan JSON. If it cannot be found in the output,
+		// the orchestrator will reject this PM plan task during expansion.
+		meta["plan"] = extractPlanJSON(agentOutput)
 		_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, meta)
 		return
 	}
@@ -598,6 +606,26 @@ func writeRunMetadata(st *store.Store, r *Run, t *task.Task, agentOutput string)
 		}
 	}
 	_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, meta)
+}
+
+// extractPlanJSON finds the last JSON object in the agent output that contains a "plan" key.
+// It returns an empty plan only if no such object is found.
+func extractPlanJSON(output string) string {
+	start := strings.LastIndex(output, `{"plan"`)
+	if start == -1 {
+		start = strings.LastIndex(output, `{"tasks"`)
+	}
+	if start == -1 {
+		return `{"plan":{"tasks":[]}}`
+	}
+	end := strings.Index(output[start:], "}\n")
+	if end == -1 {
+		end = strings.Index(output[start:], "}\r\n")
+	}
+	if end == -1 {
+		return output[start:]
+	}
+	return output[start : start+end+1]
 }
 
 func logEvent(st *store.Store, r *Run, agent, typ, tool, payload string) error {
