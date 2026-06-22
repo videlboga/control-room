@@ -75,7 +75,12 @@ func projectCmd() *cobra.Command {
 			repo, _ := cmd.Flags().GetString("repo")
 			team, _ := cmd.Flags().GetString("default-team")
 			docsDir, _ := cmd.Flags().GetString("docs-dir")
-			p := &project.Project{ID: id, Title: title, RepoPath: repo, DefaultTeam: team, DocsDir: docsDir}
+			testCmd, _ := cmd.Flags().GetString("test-command")
+			lintCmd, _ := cmd.Flags().GetString("lint-command")
+			p := &project.Project{
+				ID: id, Title: title, RepoPath: repo, DefaultTeam: team, DocsDir: docsDir,
+				TestCommand: testCmd, LintCommand: lintCmd,
+			}
 			if err := project.Create(st, p); err != nil {
 				return err
 			}
@@ -88,6 +93,8 @@ func projectCmd() *cobra.Command {
 	create.Flags().String("repo", "", "path to git repo")
 	create.Flags().String("default-team", "", "default team id")
 	create.Flags().String("docs-dir", "", "directory with project docs")
+	create.Flags().String("test-command", "", "command to run tests (e.g. go test ./...)")
+	create.Flags().String("lint-command", "", "command to run lint (e.g. go vet ./...)")
 	_ = create.MarkFlagRequired("id")
 	_ = create.MarkFlagRequired("title")
 
