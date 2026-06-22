@@ -41,12 +41,12 @@ type PlanTask struct {
 
 // transitions defines the allowed next states from a completed task.
 var transitions = map[task.TaskType]map[string]task.TaskType{
-	task.TypeResearch:      {"approved": task.TypeQAReview},
+	task.TypeResearch:      {"approved": task.TypeQAReview, "rejected": task.TypeResearch},
 	task.TypeQAReview:      {"approved": task.TypePMPlan, "rejected": task.TypeResearch},
-	task.TypePMPlan:        {"approved": task.TypeEngineering},
+	task.TypePMPlan:        {"approved": task.TypeEngineering}, // expansion handled specially
 	task.TypeEngineering:   {"approved": task.TypeQAVerify, "rejected": task.TypeEngineering},
-	task.TypeQAVerify:      {"approved": task.TypePMConsistency, "rejected": task.TypeEngineering},
-	task.TypePMConsistency: {"approved": task.TypeEngineering}, // terminal marker; handled specially
+	task.TypeQAVerify:      {"approved": task.TypePMConsistency, "rejected": task.TypeQAVerify},
+	task.TypePMConsistency: {"approved": task.TypeEngineering, "rejected": task.TypeQAVerify},
 }
 
 // RunEpic expands an Epic into workflow tasks and drives them to completion.
@@ -178,8 +178,11 @@ func (o *Orchestrator) RunEpic(epicID string, cb func(string, ...interface{})) e
 			}
 
 			nextType := transitions[ready.Type]["approved"]
-			if nextType == "" {
-				return fmt.Errorf("no approved transition for task type %s", ready.Type)
+			if nextType == "" || nextType == task.TypeQAVerify {
+				// Engineering approved: the orchestrator already created a single QA verify
+				// task that depends on all engineering tasks. No new task is created here.
+				cb("task_done", ready.ID)
+				continue
 			}
 			if nextType == task.TypeEngineering {
 				// PM plan expands to engineering tasks.
@@ -402,6 +405,30 @@ func (o *Orchestrator) expandEngineering(pmTask *task.Task) error {
 		}
 		t.Dependencies = newDeps
 		_ = task.Update(o.Store, &t)
+	}
+
+	// After all engineering tasks are defined, create a single QA verify task that
+	// depends on every engineering task. This keeps the workflow deterministic and
+	// avoids creating duplicate QA tasks when individual engineering tasks finish.
+	var engIDs []string
+	for _, t := range created {
+		if t.Type == task.TypeEngineering && t.ParentID == pmTask.ID {
+			engIDs = append(engIDs, t.ID)
+		}
+	}
+	if len(engIDs) > 0 {
+		_, err = task.Create(o.Store, &task.Task{
+			Title:       "QA verify: " + e.Title,
+			Type:        task.TypeQAVerify,
+			ProjectID:   e.ProjectID,
+			EpicID:      e.ID,
+			ParentID:    pmTask.ID,
+			TeamID:      pmTask.TeamID,
+			Dependencies: engIDs,
+		})
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

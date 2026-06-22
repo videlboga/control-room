@@ -13,6 +13,7 @@ type WorkspaceConfig struct {
 	HermesUser          string `yaml:"hermes_user"`
 	HermesSourceProfile string `yaml:"hermes_source_profile"`
 	MaxConcurrentRuns   int    `yaml:"max_concurrent_runs"`
+	StubMode            bool   `yaml:"stub_mode"`
 }
 
 const (

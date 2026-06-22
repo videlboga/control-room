@@ -15,6 +15,7 @@ type Store struct {
 	HermesUser          string
 	HermesSourceProfile string
 	MaxConcurrentRuns   int
+	StubMode            bool
 }
 
 func New(root string) *Store {

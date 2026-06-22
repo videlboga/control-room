@@ -24,6 +24,7 @@ func NewRootCmd() *cobra.Command {
 	var root string
 	var hermesUser string
 	var hermesSource string
+	var stub bool
 	rootCmd := &cobra.Command{
 		Use:   "hw",
 		Short: "Hermes Workspace -- lightweight project/team/run orchestrator",
@@ -41,12 +42,16 @@ func NewRootCmd() *cobra.Command {
 			if hermesSource != "" {
 				cfg.HermesSourceProfile = hermesSource
 			}
+			if stub {
+				cfg.StubMode = true
+			}
 			return nil
 		},
 	}
 	rootCmd.PersistentFlags().StringVarP(&root, "workspace", "w", "", "workspace root directory")
 	rootCmd.PersistentFlags().StringVar(&hermesUser, "hermes-user", "", "user that owns Hermes profiles")
 	rootCmd.PersistentFlags().StringVar(&hermesSource, "hermes-source", "", "default source Hermes profile to clone")
+	rootCmd.PersistentFlags().BoolVar(&stub, "stub", false, "stub mode: simulate agent runs without invoking Hermes")
 
 	rootCmd.AddCommand(projectCmd())
 	rootCmd.AddCommand(epicCmd())
@@ -539,6 +544,7 @@ func storeFromFlags(cmd *cobra.Command) *store.Store {
 		s.HermesUser = cfg.HermesUser
 		s.HermesSourceProfile = cfg.HermesSourceProfile
 		s.MaxConcurrentRuns = cfg.MaxConcurrentRuns
+		s.StubMode = cfg.StubMode
 	}
 	if user, err := cmd.Flags().GetString("hermes-user"); err == nil && user != "" {
 		s.HermesUser = user
@@ -548,6 +554,9 @@ func storeFromFlags(cmd *cobra.Command) *store.Store {
 	}
 	if max, err := cmd.Flags().GetInt("max-concurrent"); err == nil && max > 0 {
 		s.MaxConcurrentRuns = max
+	}
+	if stub, err := cmd.Flags().GetBool("stub"); err == nil {
+		s.StubMode = stub
 	}
 	return s
 }

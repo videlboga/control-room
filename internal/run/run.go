@@ -246,6 +246,11 @@ func Cancel(st *store.Store, id string) error {
 }
 
 func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team.Team, slot int) {
+	if st.StubMode {
+		executeStub(st, r, t, p, te, slot)
+		return
+	}
+
 	steps := []string{"plan", "implement", "review", "finalize"}
 	if len(te.Workflow) > 0 {
 		steps = te.Workflow
@@ -289,6 +294,99 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 
 	r.Status = "done"
 	r.Summary = fmt.Sprintf("Completed workflow for task %s using team %s", t.ID, te.ID)
+	r.EndedAt = time.Now().UTC().Format(time.RFC3339)
+	_ = logEvent(st, r, "system", "info", "", r.Summary)
+	_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
+
+	_ = releaseSlot(st, slot)
+}
+
+// stubPlan mirrors the orchestrator Plan shape without importing the orchestrator
+// package (that would create an import cycle).
+type stubPlan struct {
+	Tasks []stubPlanTask `json:"tasks"`
+}
+
+type stubPlanTask struct {
+	ID             string   `json:"id"`
+	Type           string   `json:"type"`
+	Specialization string   `json:"specialization"`
+	Title          string   `json:"title"`
+	Description    string   `json:"description,omitempty"`
+	Dependencies   []string `json:"dependencies,omitempty"`
+}
+
+// executeStub simulates an agent run without invoking Hermes.
+// It is used for deterministic end-to-end tests of the orchestrator.
+func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team.Team, slot int) {
+	_ = logEvent(st, r, "stub", "info", "", fmt.Sprintf("stub run for task %s type %s", t.ID, t.Type))
+
+	agentName := defaultAgentName(te)
+	r.Agent = agentName
+	r.Step = "stub"
+	_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
+
+	verdict := "approve"
+	reason := "stub approved"
+
+	switch t.Type {
+	case task.TypeQAVerify:
+		// First QA verification attempt is rejected to exercise the redo path.
+		if t.RedoIndex == 0 {
+			verdict = "reject"
+			reason = "stub: first QA verification rejected to test redo"
+			_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, map[string]string{
+				"verdict": "reject",
+				"reason":  reason,
+			})
+		} else {
+			// Write a fake diff and review note so gate checks pass.
+			if r.Worktree != "" {
+				_ = writeStubDiff(r.Worktree, "qa-verify")
+			}
+			_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, map[string]string{
+				"verdict":         "approve",
+				"reason":          "stub QA verify passed",
+				"qa_review_note":  "- checked diff exists\n- checked unit tests\n- checked lint clean",
+			})
+		}
+	case task.TypePMPlan:
+		// Generate a multi-task engineering plan with dependencies to test DAG expansion.
+		plan := stubPlan{
+			Tasks: []stubPlanTask{
+				{ID: "eng-core", Type: "engineering", Specialization: "backend", Title: "Implement core logic", Dependencies: []string{}},
+				{ID: "eng-tests", Type: "engineering", Specialization: "backend", Title: "Add unit tests", Dependencies: []string{"eng-core"}},
+				{ID: "eng-cli", Type: "engineering", Specialization: "cli", Title: "Wire CLI commands", Dependencies: []string{"eng-core"}},
+				{ID: "eng-docs", Type: "engineering", Specialization: "docs", Title: "Update documentation", Dependencies: []string{"eng-cli"}},
+			},
+		}
+		planJSON, _ := json.Marshal(plan)
+		writeRunMetadata(st, r, t, "")
+		_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, map[string]string{
+			"verdict": "approve",
+			"reason":  "stub PM plan generated",
+			"plan":    string(planJSON),
+		})
+	default:
+		writeRunMetadata(st, r, t, "")
+	}
+
+	// Override verdict/reason for non-plan types, except qa_verify which already wrote
+	// its metadata including the review note above.
+	if t.Type != task.TypePMPlan && t.Type != task.TypeQAVerify {
+		_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, map[string]string{
+			"verdict": verdict,
+			"reason":  reason,
+		})
+	}
+
+	_ = logEvent(st, r, "stub", "tool_call", "verdict", fmt.Sprintf("verdict=%s reason=%s", verdict, reason))
+
+	t.Status = "done"
+	_ = task.Update(st, t)
+
+	r.Status = "done"
+	r.Summary = fmt.Sprintf("Completed stub workflow for task %s using team %s", t.ID, te.ID)
 	r.EndedAt = time.Now().UTC().Format(time.RFC3339)
 	_ = logEvent(st, r, "system", "info", "", r.Summary)
 	_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
@@ -456,6 +554,22 @@ func runGitAsHermes(user, repo string, args ...string) ([]byte, error) {
 	}
 	cmd := exec.Command("sudo", "-u", user, "bash", "-lc", fmt.Sprintf("cd %q && git %s", repo, quotedArgs))
 	return cmd.CombinedOutput()
+}
+
+// writeStubDiff creates a tiny fake uncommitted change so gate checks see a non-empty diff.
+func writeStubDiff(worktree, marker string) error {
+	f, err := os.OpenFile(filepath.Join(worktree, "stub-output.md"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(f, "\n## %s\n\nstub change %d\n", marker, time.Now().UnixNano())
+	_ = f.Close()
+	if err != nil {
+		return err
+	}
+	_ = exec.Command("git", "-C", worktree, "add", "stub-output.md").Run()
+	// Leave the change staged but not committed so git diff HEAD is non-empty.
+	return nil
 }
 
 
