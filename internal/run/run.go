@@ -98,13 +98,17 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 	if p.RepoPath != "" {
 		wtRoot := filepath.Join(st.Root, "worktrees", t.ProjectID, runID)
 		_ = os.MkdirAll(filepath.Join(st.Root, "worktrees", t.ProjectID), 0o755)
-		_ = ensureHermesOwnership(filepath.Join(st.Root, "worktrees", t.ProjectID), user)
+		if !st.StubMode {
+			_ = ensureHermesOwnership(filepath.Join(st.Root, "worktrees", t.ProjectID), user)
+		}
 		_ = os.MkdirAll(wtRoot, 0o755)
-		_ = ensureHermesOwnership(wtRoot, user)
+		if !st.StubMode {
+			_ = ensureHermesOwnership(wtRoot, user)
+		}
 
-		out, err := runGitAsHermes(user, p.RepoPath, "worktree", "add", "-b", r.Branch, wtRoot)
+		out, err := runGitAsHermes(st.StubMode, user, p.RepoPath, "worktree", "add", "-b", r.Branch, wtRoot)
 		if err != nil {
-			out2, err2 := runGitAsHermes(user, p.RepoPath, "worktree", "add", wtRoot, r.Branch)
+			out2, err2 := runGitAsHermes(st.StubMode, user, p.RepoPath, "worktree", "add", wtRoot, r.Branch)
 			if err2 != nil {
 				_ = logEvent(st, r, "system", "error", "git", string(out)+"\n"+string(out2))
 				r.Status = "failed"
@@ -115,7 +119,9 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 			out = out2
 		}
 		r.Worktree = wtRoot
-		_ = ensureHermesOwnership(wtRoot, user)
+		if !st.StubMode {
+			_ = ensureHermesOwnership(wtRoot, user)
+		}
 		_ = exec.Command("git", "-C", wtRoot, "config", "user.email", "hw@hermes.local").Run()
 		_ = exec.Command("git", "-C", wtRoot, "config", "user.name", "Hermes Workspace").Run()
 		_ = logEvent(st, r, "system", "tool_call", "git", "worktree add "+wtRoot+" "+r.Branch+"\n"+string(out))
@@ -387,8 +393,9 @@ func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 				{ID: "eng-docs", Type: "engineering", Specialization: "docs", Title: "Update documentation", Dependencies: []string{"eng-cli"}},
 			},
 		}
-		planJSON, _ := json.Marshal(plan)
-		writeRunMetadata(st, r, t, "")
+		inner, _ := json.Marshal(plan) // {"tasks":[...]}
+		wrapper := map[string]json.RawMessage{"plan": inner}
+		planJSON, _ := json.Marshal(wrapper) // {"plan":{"tasks":[...]}}
 		_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, map[string]string{
 			"verdict": "approve",
 			"reason":  "stub PM plan generated",
@@ -581,7 +588,7 @@ func ensureHermesOwnership(path, user string) error {
 	return exec.Command("chown", "-R", user+":"+user, path).Run()
 }
 
-func runGitAsHermes(user, repo string, args ...string) ([]byte, error) {
+func runGitAsHermes(stub bool, user, repo string, args ...string) ([]byte, error) {
 	quotedArgs := ""
 	for _, a := range args {
 		if quotedArgs != "" {
@@ -589,7 +596,13 @@ func runGitAsHermes(user, repo string, args ...string) ([]byte, error) {
 		}
 		quotedArgs += fmt.Sprintf("%q", a)
 	}
-	cmd := exec.Command("sudo", "-u", user, "bash", "-lc", fmt.Sprintf("cd %q && git %s", repo, quotedArgs))
+	var cmd *exec.Cmd
+	if stub {
+		// In stub mode we run git as the current process user, no sudo required.
+		cmd = exec.Command("bash", "-c", fmt.Sprintf("cd %q && git %s", repo, quotedArgs))
+	} else {
+		cmd = exec.Command("sudo", "-u", user, "bash", "-lc", fmt.Sprintf("cd %q && git %s", repo, quotedArgs))
+	}
 	return cmd.CombinedOutput()
 }
 
