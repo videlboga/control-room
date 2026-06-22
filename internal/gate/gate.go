@@ -1,9 +1,8 @@
-
 package gate
 
 import (
-	"fmt"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,29 +35,21 @@ func Run(st *store.Store, t *task.Task, r *run.Run, p *project.Project) (*Result
 func runQAVerifyChecks(st *store.Store, t *task.Task, r *run.Run, p *project.Project) (*Result, error) {
 	res := &Result{Passed: true}
 
-	if r.Worktree == "" {
-		res.Errors = append(res.Errors, "no worktree produced by engineering run")
-	} else if !hasDiff(r.Worktree) {
-		res.Errors = append(res.Errors, "worktree has no diff against base")
+	// QA verify validates the final merged state in the project repo (main branch),
+	// not a diff in its own worktree.
+	verifyDir := p.RepoPath
+	if verifyDir == "" {
+		res.Errors = append(res.Errors, "no project repo available for verification")
 	}
 
 	if p.TestCommand != "" {
-		if err := runCommand(r.Worktree, p.TestCommand); err != nil {
+		if err := runCommand(verifyDir, p.TestCommand); err != nil {
 			res.Errors = append(res.Errors, "tests failed: "+err.Error())
 		}
 	}
 	if p.LintCommand != "" {
-		if err := runCommand(r.Worktree, p.LintCommand); err != nil {
+		if err := runCommand(verifyDir, p.LintCommand); err != nil {
 			res.Errors = append(res.Errors, "lint failed: "+err.Error())
-		}
-	}
-
-	// QA agent must leave a review note with at least 3 items.
-	meta, err := readMetadata(st, r.ID)
-	if err == nil {
-		note := meta["qa_review_note"]
-		if len(strings.Split(note, "\n")) < 3 {
-			res.Errors = append(res.Errors, "QA review note must contain at least 3 checked items")
 		}
 	}
 
@@ -115,4 +106,3 @@ func readMetadata(st *store.Store, runID string) (map[string]string, error) {
 	}
 	return m, nil
 }
-

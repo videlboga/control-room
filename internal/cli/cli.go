@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spf13/cobra"
 	"control-room/internal/config"
 	"control-room/internal/epic"
 	"control-room/internal/orchestrator"
@@ -20,6 +19,7 @@ import (
 	"control-room/internal/store"
 	"control-room/internal/task"
 	"control-room/internal/team"
+	"github.com/spf13/cobra"
 )
 
 func NewRootCmd() *cobra.Command {
@@ -314,7 +314,6 @@ func taskCmd() *cobra.Command {
 	return cmd
 }
 
-
 func epicCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "epic", Short: "Manage epics"}
 
@@ -385,7 +384,6 @@ func epicCmd() *cobra.Command {
 	return cmd
 }
 
-
 func orchestrateCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "orchestrate",
@@ -402,7 +400,7 @@ func orchestrateCmd() *cobra.Command {
 			if epicID == "" {
 				return errors.New("--epic is required")
 			}
-			o := orchestrator.Orchestrator{Store: st, ManualApprove: manual}
+			o := orchestrator.Orchestrator{Store: st, ManualApprove: manual, MaxRedo: 3}
 			if manual {
 				o.Prompt = manualApprovePrompt(cmd.InOrStdin(), cmd.OutOrStdout())
 			}
@@ -429,7 +427,7 @@ func orchestrateCmd() *cobra.Command {
 			if epicID == "" {
 				return errors.New("--epic is required")
 			}
-			o := orchestrator.Orchestrator{Store: st, ManualApprove: manual}
+			o := orchestrator.Orchestrator{Store: st, ManualApprove: manual, MaxRedo: 3}
 			if manual {
 				o.Prompt = manualApprovePrompt(cmd.InOrStdin(), cmd.OutOrStdout())
 			}
