@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"control-room/internal/epic"
@@ -235,11 +236,192 @@ func (o *Orchestrator) RunEpic(epicID string, cb func(string, ...interface{})) e
 	}
 }
 
-// nextReadyTask returns the next task that can start:
-// - status open
-// - all dependencies done/approved
-// - earlier redo_index in the same group preferred
-func (o *Orchestrator) nextReadyTask(epicID string) (*task.Task, error) {
+// WatchEpic runs a detached-style orchestration loop. It starts every ready task
+// in parallel, waits for all of them, then applies transitions and repeats.
+func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{})) error {
+	e, err := epic.Get(o.Store, epicID)
+	if err != nil {
+		return err
+	}
+	if e.Status == "done" {
+		return errors.New("epic already done")
+	}
+	e.Status = "in_progress"
+	_ = epic.Update(o.Store, e)
+
+	proj, err := project.Get(o.Store, e.ProjectID)
+	if err != nil {
+		return err
+	}
+	if proj.DefaultTeam == "" {
+		return errors.New("project has no default team for workflow tasks")
+	}
+
+	children, err := task.ListByEpic(o.Store, epicID)
+	if err != nil {
+		return err
+	}
+	var researchTask *task.Task
+	for _, c := range children {
+		if c.Type == task.TypeResearch {
+			researchTask = &c
+			break
+		}
+	}
+	if researchTask == nil {
+		researchTask, err = task.Create(o.Store, &task.Task{
+			Title:       "Research: " + e.Title,
+			Description: e.Description,
+			Type:        task.TypeResearch,
+			ProjectID:   e.ProjectID,
+			EpicID:      e.ID,
+			TeamID:      proj.DefaultTeam,
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	type taskResult struct {
+		t       *task.Task
+		r       *run.Run
+		verdict string
+		reason  string
+	}
+
+	for {
+		ready, err := o.nextReadyTasks(epicID)
+		if err != nil {
+			return err
+		}
+		if len(ready) == 0 {
+			if o.epicFinished(epicID) {
+				e.Status = "done"
+				_ = epic.Update(o.Store, e)
+				cb("epic_done", e.ID)
+				return nil
+			}
+			cb("waiting_for_review", epicID)
+			return errors.New("no ready tasks: remaining tasks are pending review or blocked")
+		}
+
+		cb("batch_ready", len(ready))
+		for _, t := range ready {
+			cb("task_start", t.ID, t.Type)
+		}
+
+		var wg sync.WaitGroup
+		mu := sync.Mutex{}
+		results := make(map[string]*taskResult, len(ready))
+		for i := range ready {
+			t := &ready[i]
+			r, err := run.Start(o.Store, t.ID)
+			if err != nil {
+				return fmt.Errorf("failed to start run for task %s: %w", t.ID, err)
+			}
+			wg.Add(1)
+			go func(t *task.Task, r *run.Run) {
+				defer wg.Done()
+				_ = run.WaitFor(o.Store, r.ID, func(ev run.Event) {
+					cb("event", ev)
+				})
+				verdict, reason, verdictErr := o.readVerdict(r.ID)
+				if verdictErr != nil {
+					cb("verdict_error", t.ID, verdictErr)
+					verdict = "reject"
+					reason = "no valid verdict in run metadata: " + verdictErr.Error()
+				}
+				if o.ManualApprove && t.Type == task.TypeQAVerify && verdict == "approve" {
+					if o.Prompt != nil {
+						cb("awaiting_manual_approval", t.ID)
+						verdict, reason = o.Prompt(t.ID)
+						cb("manual_verdict", t.ID, verdict, reason)
+					}
+				}
+				if verdict == "approve" {
+					proj, _ := project.Get(o.Store, e.ProjectID)
+					g, err := gate.Run(o.Store, t, r, proj)
+					if err != nil {
+						cb("gate_error", t.ID, err)
+						verdict = "reject"
+						reason = "gate check error: " + err.Error()
+					} else if !g.Passed {
+						cb("gate_failed", t.ID, g.Errors)
+						verdict = "reject"
+						reason = "gate checks failed: " + strings.Join(g.Errors, "; ")
+					}
+				}
+				mu.Lock()
+				results[t.ID] = &taskResult{t: t, r: r, verdict: verdict, reason: reason}
+				mu.Unlock()
+			}(t, r)
+		}
+		wg.Wait()
+
+		for _, res := range results {
+			ready := res.t
+			verdict := res.verdict
+			reason := res.reason
+
+			cb("task_verdict", ready.ID, verdict, reason)
+
+			if verdict == "approve" {
+				ready.Status = task.StatusApproved
+				ready.EndedAt = time.Now().UTC().Format(time.RFC3339)
+				_ = task.Update(o.Store, ready)
+
+				if ready.Type == task.TypePMConsistency {
+					e.Status = "done"
+					_ = epic.Update(o.Store, e)
+					cb("epic_done", e.ID)
+					return nil
+				}
+
+				nextType := transitions[ready.Type]["approved"]
+				if nextType == "" || nextType == task.TypeQAVerify {
+					cb("task_done", ready.ID)
+					continue
+				}
+				if nextType == task.TypeEngineering {
+					if err := o.expandEngineering(ready); err != nil {
+						return err
+					}
+				} else {
+					if _, err := task.Create(o.Store, &task.Task{
+						Title:       o.nextTitle(nextType, ready),
+						Type:        nextType,
+						ProjectID:   e.ProjectID,
+						EpicID:      e.ID,
+						ParentID:    ready.ID,
+						TeamID:      proj.DefaultTeam,
+						Description: ready.Description,
+					}); err != nil {
+						return err
+					}
+				}
+			} else {
+				ready.Status = task.StatusRejected
+				_ = task.Update(o.Store, ready)
+
+				redoType := transitions[ready.Type]["rejected"]
+				if redoType == "" {
+					redoType = ready.Type
+				}
+				redo, err := task.Redo(o.Store, ready, reason)
+				if err != nil {
+					return err
+				}
+				redo.Type = redoType
+				_ = task.Update(o.Store, redo)
+				cb("redo_created", redo.ID, redoType, reason)
+			}
+		}
+	}
+}
+
+// nextReadyTasks returns all tasks that can start in parallel: one per group,
+// with dependencies satisfied.
+func (o *Orchestrator) nextReadyTasks(epicID string) ([]task.Task, error) {
 	tasks, err := task.ListByEpic(o.Store, epicID)
 	if err != nil {
 		return nil, err
@@ -257,7 +439,6 @@ func (o *Orchestrator) nextReadyTask(epicID string) (*task.Task, error) {
 		}
 	}
 
-	// topological ordering: dependency-aware ready tasks
 	var ready []task.Task
 	for _, t := range bestByGroup {
 		depsOK := true
@@ -272,11 +453,7 @@ func (o *Orchestrator) nextReadyTask(epicID string) (*task.Task, error) {
 			ready = append(ready, t)
 		}
 	}
-	if len(ready) == 0 {
-		return nil, nil
-	}
 
-	// Deterministic pick: by type order then creation time.
 	typeOrder := map[task.TaskType]int{
 		task.TypeResearch:      0,
 		task.TypeQAReview:      1,
@@ -292,6 +469,18 @@ func (o *Orchestrator) nextReadyTask(epicID string) (*task.Task, error) {
 		return ready[i].CreatedAt < ready[j].CreatedAt
 	})
 
+	return ready, nil
+}
+
+// nextReadyTask returns the next task that can start.
+func (o *Orchestrator) nextReadyTask(epicID string) (*task.Task, error) {
+	ready, err := o.nextReadyTasks(epicID)
+	if err != nil {
+		return nil, err
+	}
+	if len(ready) == 0 {
+		return nil, nil
+	}
 	return &ready[0], nil
 }
 

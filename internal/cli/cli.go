@@ -411,7 +411,34 @@ func orchestrateCmd() *cobra.Command {
 	run.Flags().Bool("manual-approve", false, "prompt for manual approval on QA verify tasks")
 	_ = run.MarkFlagRequired("epic")
 
-	cmd.AddCommand(run)
+	watch := &cobra.Command{
+		Use:   "watch",
+		Short: "Watch an epic and run ready tasks in parallel batches",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			epicID, _ := cmd.Flags().GetString("epic")
+			manual, _ := cmd.Flags().GetBool("manual-approve")
+			if epicID == "" {
+				return errors.New("--epic is required")
+			}
+			o := orchestrator.Orchestrator{Store: st, ManualApprove: manual}
+			if manual {
+				o.Prompt = manualApprovePrompt(cmd.InOrStdin(), cmd.OutOrStdout())
+			}
+			return o.WatchEpic(epicID, func(event string, args ...interface{}) {
+				fmt.Printf("[orch] %s", event)
+				for _, a := range args {
+					fmt.Printf(" %v", a)
+				}
+				fmt.Println()
+			})
+		},
+	}
+	watch.Flags().String("epic", "", "epic id")
+	watch.Flags().Bool("manual-approve", false, "prompt for manual approval on QA verify tasks")
+	_ = watch.MarkFlagRequired("epic")
+
+	cmd.AddCommand(run, watch)
 	return cmd
 }
 
