@@ -317,16 +317,17 @@ func Cancel(st *store.Store, id string) error {
 		return errors.New("run already finished")
 	}
 	if r.PID > 0 {
-		_ = logEvent(st, r, "system", "info", "", fmt.Sprintf("sending SIGTERM to hermes process %d", r.PID))
-		if proc, err := os.FindProcess(r.PID); err == nil {
-			_ = proc.Signal(syscall.SIGTERM)
-			go func() {
-				time.Sleep(10 * time.Second)
-				if proc2, err := os.FindProcess(r.PID); err == nil {
-					_ = proc2.Signal(syscall.SIGKILL)
-				}
-			}()
-		}
+		_ = logEvent(st, r, "system", "info", "", fmt.Sprintf("sending SIGTERM to hermes process group %d", r.PID))
+		// Kill the entire process group so child processes spawned by hermes
+		// are also terminated gracefully.
+		_ = syscall.Kill(-r.PID, syscall.SIGTERM)
+		go func(pid int) {
+			time.Sleep(10 * time.Second)
+			if isProcessAlive(pid) {
+				_ = logEvent(st, r, "system", "warn", "", fmt.Sprintf("hermes process %d still alive after SIGTERM, sending SIGKILL to group", pid))
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+			}
+		}(r.PID)
 	}
 	r.Status = "cancelled"
 	r.EndedAt = time.Now().UTC().Format(time.RFC3339)
@@ -698,6 +699,9 @@ func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns in
 	}
 	// Preserve PATH and other env needed by Hermes when running under sudo.
 	cmd.Env = append(os.Environ(), "HOME=/home/"+user)
+	// Run hermes in its own process group so we can terminate the whole tree
+	// (hermes + any spawned children) on cancel or timeout.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -738,7 +742,9 @@ func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns in
 	// Hermes tool calls already have their own timeouts; this catches a truly stuck
 	// process rather than imposing a wall-clock limit on the whole run.
 	done := make(chan struct{})
-	go monitorHermesActivity(cmd, activityPath, 3*time.Minute, done)
+	logPath := filepath.Join(filepath.Dir(activityPath), "agent.log")
+	go monitorHermesActivity(cmd, logPath, 3*time.Minute, done)
+	go monitorToolLimitReached(cmd, logPath, done)
 
 	err = cmd.Wait()
 	close(done)
@@ -749,7 +755,6 @@ func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns in
 	}
 	return cleanHermesOutput(outBuf.String()), nil
 }
-
 
 // appendAgentLog writes a timestamped line to the run agent log.
 func appendAgentLog(activityPath, line string) error {
@@ -763,9 +768,11 @@ func appendAgentLog(activityPath, line string) error {
 	return err
 }
 
-// monitorHermesActivity polls the activity log mtime. If it has not changed for
-// longer than staleThreshold and the process is still running, it kills the process.
-func monitorHermesActivity(cmd *exec.Cmd, activityPath string, staleThreshold time.Duration, done <-chan struct{}) {
+// monitorHermesActivity polls the agent log mtime. If it has not changed for
+// longer than staleThreshold and the process is still running, it kills the
+// whole process group. This catches a stuck agent without imposing a wall-clock
+// limit on legitimate long runs.
+func monitorHermesActivity(cmd *exec.Cmd, logPath string, staleThreshold time.Duration, done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	lastMtime := time.Now()
@@ -774,13 +781,51 @@ func monitorHermesActivity(cmd *exec.Cmd, activityPath string, staleThreshold ti
 		case <-done:
 			return
 		case <-ticker.C:
-			info, err := os.Stat(activityPath)
+			info, err := os.Stat(logPath)
 			if err == nil && info.ModTime().After(lastMtime) {
 				lastMtime = info.ModTime()
 			}
 			if time.Since(lastMtime) > staleThreshold {
 				if cmd.Process != nil {
-					_ = cmd.Process.Kill()
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				return
+			}
+		}
+	}
+}
+
+// monitorToolLimitReached watches the agent log for signs that hermes hit its
+// tool-use/max-turns ceiling but failed to exit. If the process is still alive
+// 30 seconds after such a message, the whole process group is killed.
+func monitorToolLimitReached(cmd *exec.Cmd, logPath string, done <-chan struct{}) {
+	limitPhrases := []string{
+		"maximum tool calls exceeded",
+		"max turns reached",
+		"tool use limit reached",
+		"turn limit reached",
+	}
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	var limitSeen time.Time
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			data, err := os.ReadFile(logPath)
+			if err == nil {
+				text := strings.ToLower(string(data))
+				for _, phrase := range limitPhrases {
+					if strings.Contains(text, phrase) && limitSeen.IsZero() {
+						limitSeen = time.Now()
+						break
+					}
+				}
+			}
+			if !limitSeen.IsZero() && time.Since(limitSeen) > 30*time.Second {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 				}
 				return
 			}
