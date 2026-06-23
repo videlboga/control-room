@@ -110,6 +110,10 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 		}
 
 		baseRef := "HEAD"
+		if !st.StubMode {
+			_ = ensureHermesOwnership(p.RepoPath, user)
+		}
+		_ = exec.Command("sudo", "-u", user, "git", "config", "--global", "--add", "safe.directory", p.RepoPath).Run()
 		if p.BaseCommit != "" {
 			baseRef = p.BaseCommit
 		}
@@ -127,6 +131,8 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 		}
 		_ = exec.Command("git", "-C", wtRoot, "config", "user.email", "hw@hermes.local").Run()
 		_ = exec.Command("git", "-C", wtRoot, "config", "user.name", "Hermes Workspace").Run()
+		_ = exec.Command("sudo", "-u", user, "git", "config", "--global", "--add", "safe.directory", wtRoot).Run()
+		_ = exec.Command("sudo", "-u", user, "git", "config", "--global", "--add", "safe.directory", p.RepoPath).Run()
 		_ = logEvent(st, r, "system", "tool_call", "git", "worktree add "+wtRoot+" "+r.Branch+" from "+baseRef+"\n"+string(out))
 		_ = seedWorktreeDocs(st, r, p, wtRoot)
 	}
@@ -344,10 +350,10 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 
 	// Auto-commit any changes the agent produced so downstream worktrees inherit them.
 	if !hermesFailed && p.RepoPath != "" && r.Worktree != "" {
-		_ = exec.Command("git", "-C", r.Worktree, "add", "-A").Run()
-		if _, err := exec.Command("git", "-C", r.Worktree, "diff", "--cached", "--quiet").CombinedOutput(); err != nil {
+		_, _ = runGitAsHermes(st.StubMode, user, r.Worktree, "add", "-A")
+		if _, err := runGitAsHermes(st.StubMode, user, r.Worktree, "diff", "--cached", "--quiet"); err != nil {
 			commitMsg := fmt.Sprintf("agent: %s %s\n\n%s", t.Type, t.ID, t.Title)
-			if out, cerr := exec.Command("git", "-C", r.Worktree, "commit", "-m", commitMsg).CombinedOutput(); cerr != nil {
+			if out, cerr := runGitAsHermes(st.StubMode, user, r.Worktree, "commit", "-m", commitMsg); cerr != nil {
 				_ = logEvent(st, r, "system", "error", "git", "commit failed: "+cerr.Error()+"\n"+string(out))
 			} else {
 				_ = logEvent(st, r, "system", "info", "git", "committed agent changes")
@@ -536,8 +542,8 @@ func TestGreet(t *testing.T) {
 }
 `), 0o644)
 			// Stage and commit changes so they can be merged back to the project repo.
-			_ = exec.Command("git", "-C", r.Worktree, "add", ".").Run()
-			_ = exec.Command("git", "-C", r.Worktree, "commit", "-m", "stub: engineering "+t.ID).Run()
+			_, _ = runGitAsHermes(true, "", r.Worktree, "add", ".")
+			_, _ = runGitAsHermes(true, "", r.Worktree, "commit", "-m", "stub: engineering "+t.ID)
 		}
 	default:
 		writeRunMetadata(st, r, t, "", false)
