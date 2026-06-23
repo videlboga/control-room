@@ -247,6 +247,11 @@ func (o *Orchestrator) RunEpic(epicID string, cb func(string, ...interface{})) e
 			}
 			redo.Type = redoType
 			_ = task.Update(o.Store, redo)
+			if redoType == task.TypeEngineering {
+				if err := o.updateDependenciesAfterRedo(ready, redo); err != nil {
+					cb("redo_dep_update_error", redo.ID, err)
+				}
+			}
 			cb("redo_created", redo.ID, redoType, reason)
 		}
 	}
@@ -453,6 +458,11 @@ func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{}))
 				}
 				redo.Type = redoType
 				_ = task.Update(o.Store, redo)
+				if redoType == task.TypeEngineering {
+					if err := o.updateDependenciesAfterRedo(ready, redo); err != nil {
+						cb("redo_dep_update_error", redo.ID, err)
+					}
+				}
 				cb("redo_created", redo.ID, redoType, reason)
 			}
 		}
@@ -637,6 +647,36 @@ func (o *Orchestrator) copyResearchDoc(researchTask *task.Task) error {
 	}
 	if err := project.AddDoc(o.Store, proj.ID, src); err != nil {
 		return fmt.Errorf("AddDoc failed: %w", err)
+	}
+	return nil
+}
+
+// updateDependenciesAfterRedo replaces references to the rejected task ID
+// with the new redo task ID in all downstream task dependencies.
+func (o *Orchestrator) updateDependenciesAfterRedo(rejected, redo *task.Task) error {
+	all, err := task.List(o.Store)
+	if err != nil {
+		return err
+	}
+	for _, tt := range all {
+		if tt.EpicID != redo.EpicID {
+			continue
+		}
+		if tt.ID == redo.ID {
+			continue
+		}
+		updated := false
+		for i, dep := range tt.Dependencies {
+			if dep == rejected.ID {
+				tt.Dependencies[i] = redo.ID
+				updated = true
+			}
+		}
+		if updated {
+			if err := task.Update(o.Store, &tt); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

@@ -269,6 +269,15 @@ func runEngineeringChecks(st *store.Store, t *task.Task, r *run.Run, p *project.
 		return res, nil
 	}
 
+	// Non-code specializations only need their specific artifacts.
+	if t.Specialization == "css" {
+		if !hasFiles(r.Worktree, `.*\.css$`) {
+			res.Errors = append(res.Errors, "css task produced no .css files")
+			res.Passed = false
+		}
+		return res, nil
+	}
+
 	// Always ensure the code builds.
 	if err := runCommand(r.Worktree, "go build ./..."); err != nil {
 		res.Errors = append(res.Errors, "build failed: "+err.Error())
