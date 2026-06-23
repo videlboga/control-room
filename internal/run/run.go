@@ -109,17 +109,17 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 			_ = ensureHermesOwnership(wtRoot, user)
 		}
 
-		out, err := runGitAsHermes(st.StubMode, user, p.RepoPath, "worktree", "add", "-b", r.Branch, wtRoot)
+		baseRef := "HEAD"
+		if p.BaseCommit != "" {
+			baseRef = p.BaseCommit
+		}
+		out, err := runGitAsHermes(st.StubMode, user, p.RepoPath, "worktree", "add", "-b", r.Branch, wtRoot, baseRef)
 		if err != nil {
-			out2, err2 := runGitAsHermes(st.StubMode, user, p.RepoPath, "worktree", "add", wtRoot, r.Branch)
-			if err2 != nil {
-				_ = logEvent(st, r, "system", "error", "git", string(out)+"\n"+string(out2))
-				r.Status = "failed"
-				r.Errors++
-				_ = st.WriteJSON([]string{"runs", runID, "run.json"}, r)
-				return r, fmt.Errorf("git worktree failed: %w\n%s", err, out)
-			}
-			out = out2
+			_ = logEvent(st, r, "system", "error", "git", string(out))
+			r.Status = "failed"
+			r.Errors++
+			_ = st.WriteJSON([]string{"runs", runID, "run.json"}, r)
+			return r, fmt.Errorf("git worktree failed: %w\n%s", err, out)
 		}
 		r.Worktree = wtRoot
 		if !st.StubMode {
@@ -127,7 +127,7 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 		}
 		_ = exec.Command("git", "-C", wtRoot, "config", "user.email", "hw@hermes.local").Run()
 		_ = exec.Command("git", "-C", wtRoot, "config", "user.name", "Hermes Workspace").Run()
-		_ = logEvent(st, r, "system", "tool_call", "git", "worktree add "+wtRoot+" "+r.Branch+"\n"+string(out))
+		_ = logEvent(st, r, "system", "tool_call", "git", "worktree add "+wtRoot+" "+r.Branch+" from "+baseRef+"\n"+string(out))
 		_ = seedWorktreeDocs(st, r, p, wtRoot)
 	}
 
@@ -430,6 +430,30 @@ func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 	reason := "stub approved"
 
 	switch t.Type {
+	case task.TypeResearch:
+		// Write a minimal but valid RESEARCH.md so gate checks pass in stub mode.
+		if r.Worktree != "" {
+			wtPath := filepath.Join(r.Worktree, "RESEARCH.md")
+			_ = os.WriteFile(wtPath, []byte(`# RESEARCH.md
+
+## Stack
+- Language: Go
+- Framework: standard library
+
+## Architecture
+- Directory layout: cmd/main entrypoint, internal packages
+- Key files: main.go, go.mod
+
+## Acceptance Criteria
+- Greet returns expected string.
+- Tests pass.
+
+## Engineering Notes
+- Keep changes minimal and focused.
+`), 0o644)
+			// Register the doc with the project so downstream agents/gates can read it.
+			_ = project.AddDoc(st, p.ID, wtPath)
+		}
 	case task.TypeQAVerify:
 		// First QA verification attempt is rejected to exercise the redo path.
 		if t.RedoIndex == 0 {
@@ -452,6 +476,8 @@ func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 		}
 	case task.TypePMPlan:
 		// Generate a multi-task engineering plan with dependencies to test DAG expansion.
+		planDir := filepath.Join(r.Worktree, "docs")
+		_ = os.MkdirAll(planDir, 0o755)
 		plan := stubPlan{
 			Tasks: []stubPlanTask{
 				{ID: "eng-core", Type: "engineering", Specialization: "backend", Title: "Implement core logic", Dependencies: []string{}},
@@ -463,11 +489,56 @@ func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 		inner, _ := json.Marshal(plan) // {"tasks":[...]}
 		wrapper := map[string]json.RawMessage{"plan": inner}
 		planJSON, _ := json.Marshal(wrapper) // {"plan":{"tasks":[...]}}
+		planFile := filepath.Join(planDir, "plan.json")
+		_ = os.WriteFile(planFile, planJSON, 0o644)
+		_ = project.AddDoc(st, p.ID, planFile)
 		_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, map[string]string{
 			"verdict": "approve",
 			"reason":  "stub PM plan generated",
 			"plan":    string(planJSON),
 		})
+	case task.TypeEngineering:
+		// Ensure the stub engineering run produces a compilable cmd entrypoint so gate checks pass.
+		if r.Worktree != "" {
+			cmdDir := filepath.Join(r.Worktree, "cmd", p.ID)
+			_ = os.MkdirAll(cmdDir, 0o755)
+			mainPath := filepath.Join(cmdDir, "main.go")
+			_ = os.WriteFile(mainPath, []byte(`package main
+
+import "fmt"
+
+func Greet(name string) string {
+	return fmt.Sprintf("Hello, %s!", name)
+}
+
+func main() {
+	fmt.Println(Greet("world"))
+}
+`), 0o644)
+			// Replace the placeholder root main.go (if any) with a compilable version
+			// so that `go build ./...` does not fail on an empty package main.
+			rootMain := filepath.Join(r.Worktree, "main.go")
+			if info, err := os.Stat(rootMain); err == nil && info.Size() < 50 {
+				_ = os.WriteFile(rootMain, []byte(`package main
+
+func main() {}
+`), 0o644)
+			}
+			testPath := filepath.Join(cmdDir, "main_test.go")
+			_ = os.WriteFile(testPath, []byte(`package main
+
+import "testing"
+
+func TestGreet(t *testing.T) {
+	if got := Greet("world"); got != "Hello, world!" {
+		t.Fatalf("unexpected greeting: %s", got)
+	}
+}
+`), 0o644)
+			// Stage and commit changes so they can be merged back to the project repo.
+			_ = exec.Command("git", "-C", r.Worktree, "add", ".").Run()
+			_ = exec.Command("git", "-C", r.Worktree, "commit", "-m", "stub: engineering "+t.ID).Run()
+		}
 	default:
 		writeRunMetadata(st, r, t, "", false)
 	}
@@ -747,9 +818,13 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 	}
 	if t.VerdictReason != "" {
 		b.WriteString(fmt.Sprintf("Rejection reason to address: %s\n", t.VerdictReason))
+		b.WriteString("You are continuing this task after a previous rejection. Review the previous attempt's worktree if available and address the stated reason before giving your verdict.\n")
 	}
 	if r.Worktree != "" {
 		b.WriteString(fmt.Sprintf("Working directory (git worktree): %s\n", r.Worktree))
+		if p.BaseCommit != "" {
+			b.WriteString(fmt.Sprintf("Base commit for this worktree: %s\n", p.BaseCommit))
+		}
 		b.WriteString("You may read files and run git commands here. Prefer small, focused changes.\n")
 		switch t.Type {
 		case task.TypeQAReview:

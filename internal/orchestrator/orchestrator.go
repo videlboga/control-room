@@ -622,6 +622,18 @@ func (o *Orchestrator) copyPlanDoc(pmTask *task.Task) error {
 			return fmt.Errorf("write plan.json to docs dir failed: %w", err)
 		}
 	}
+	// Also place docs/plan.json at the project repo root so consistency checks can find it.
+	if proj.RepoPath != "" {
+		docsDir := filepath.Join(proj.RepoPath, "docs")
+		_ = os.MkdirAll(docsDir, 0o755)
+		dst := filepath.Join(docsDir, "plan.json")
+		data, _ := os.ReadFile(src)
+		if len(data) > 0 {
+			_ = os.WriteFile(dst, data, 0o644)
+			_ = exec.Command("git", "-C", proj.RepoPath, "add", "docs/plan.json").Run()
+			_ = exec.Command("git", "-C", proj.RepoPath, "commit", "-m", "docs: add plan.json").Run()
+		}
+	}
 	return project.AddDoc(o.Store, proj.ID, src)
 }
 
@@ -647,6 +659,16 @@ func (o *Orchestrator) copyResearchDoc(researchTask *task.Task) error {
 	}
 	if err := project.AddDoc(o.Store, proj.ID, src); err != nil {
 		return fmt.Errorf("AddDoc failed: %w", err)
+	}
+	// Also place RESEARCH.md at the project repo root so downstream consistency checks can find it.
+	if proj.RepoPath != "" {
+		dst := filepath.Join(proj.RepoPath, "RESEARCH.md")
+		data, _ := os.ReadFile(src)
+		if len(data) > 0 {
+			_ = os.WriteFile(dst, data, 0o644)
+			_ = exec.Command("git", "-C", proj.RepoPath, "add", "RESEARCH.md").Run()
+			_ = exec.Command("git", "-C", proj.RepoPath, "commit", "-m", "docs: add RESEARCH.md").Run()
+		}
 	}
 	return nil
 }
@@ -682,7 +704,8 @@ func (o *Orchestrator) updateDependenciesAfterRedo(rejected, redo *task.Task) er
 }
 
 // mergeApprovedWorktree merges the approved engineering worktree branch back into
-// the project's main repo so that subsequent engineering tasks inherit the state.
+// the project's main repo and advances the project's base commit so that
+// downstream runs start from the updated state.
 func (o *Orchestrator) mergeApprovedWorktree(t *task.Task) error {
 	proj, err := project.Get(o.Store, t.ProjectID)
 	if err != nil {
@@ -695,15 +718,40 @@ func (o *Orchestrator) mergeApprovedWorktree(t *task.Task) error {
 	if err != nil || len(runs) == 0 {
 		return errors.New("no run for engineering task")
 	}
-	r := runs[0]
-	if r.Branch == "" || r.Worktree == "" {
+	// Use the latest finished run for this task.
+	r := runs[len(runs)-1]
+	if r.Branch == "" {
 		return nil
 	}
-	// Ensure worktree commits are on top of current main.
-	if out, err := exec.Command("git", "-C", proj.RepoPath, "merge", "-Xtheirs", "-m", "merge "+t.ID, r.Branch).CombinedOutput(); err != nil {
-		return fmt.Errorf("merge failed: %w\n%s", err, out)
+	// Fast-forward main to the approved branch when possible; otherwise merge.
+	out, err := exec.Command("git", "-C", proj.RepoPath, "merge", "--ff-only", r.Branch).CombinedOutput()
+	if err != nil {
+		out, err = exec.Command("git", "-C", proj.RepoPath, "merge", "-Xtheirs", "-m", "merge "+t.ID, r.Branch).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("merge failed: %w\n%s", err, out)
+		}
+	}
+	// Update project base commit so that new worktrees start from the merged state.
+	head, err := currentHeadCommit(proj.RepoPath)
+	if err != nil {
+		return fmt.Errorf("failed to read merged HEAD: %w", err)
+	}
+	proj.BaseCommit = head
+	if err := project.Update(o.Store, proj); err != nil {
+		return fmt.Errorf("failed to update project base commit: %w", err)
 	}
 	return nil
+}
+
+func currentHeadCommit(repoPath string) (string, error) {
+	if repoPath == "" {
+		return "", errors.New("no repo path")
+	}
+	out, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, out)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func (o *Orchestrator) expandEngineering(pmTask *task.Task) error {

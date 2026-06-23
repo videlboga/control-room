@@ -44,7 +44,7 @@ func Run(st *store.Store, t *task.Task, r *run.Run, p *project.Project) (*Result
 // runResearchChecks ensures a non-trivial RESEARCH.md exists with required sections.
 func runResearchChecks(st *store.Store, t *task.Task, r *run.Run, p *project.Project) (*Result, error) {
 	res := &Result{Passed: true}
-	// Prefer the task worktree artifact; fall back to project docs for downstream checks.
+	// Prefer the task worktree artifact; fall back to registered project docs.
 	docPath := ""
 	if r.Worktree != "" {
 		wtPath := filepath.Join(r.Worktree, "RESEARCH.md")
@@ -52,11 +52,25 @@ func runResearchChecks(st *store.Store, t *task.Task, r *run.Run, p *project.Pro
 			docPath = wtPath
 		}
 	}
-	if docPath == "" {
-		docPath = filepath.Join(p.DocsDir, "RESEARCH.md")
+	if docPath == "" && p.DocsDir != "" {
+		candidate := filepath.Join(p.DocsDir, "RESEARCH.md")
+		if _, err := os.Stat(candidate); err == nil {
+			docPath = candidate
+		}
 	}
-	if _, err := os.Stat(docPath); err != nil {
-		res.Errors = append(res.Errors, fmt.Sprintf("RESEARCH.md missing in project docs (%s): %v", docPath, err))
+	if docPath == "" {
+		// Fall back to any registered RESEARCH.md doc.
+		for _, d := range p.Docs {
+			if filepath.Base(d) == "RESEARCH.md" {
+				if _, err := os.Stat(d); err == nil {
+					docPath = d
+					break
+				}
+			}
+		}
+	}
+	if docPath == "" {
+		res.Errors = append(res.Errors, "RESEARCH.md missing: no worktree or registered doc found")
 	} else {
 		data, err := os.ReadFile(docPath)
 		if err != nil {
@@ -148,11 +162,25 @@ func runPMPlanChecks(st *store.Store, t *task.Task, r *run.Run, p *project.Proje
 			planPath = wtPath
 		}
 	}
-	if planPath == "" {
-		planPath = filepath.Join(p.DocsDir, "docs", "plan.json")
+	if planPath == "" && p.DocsDir != "" {
+		candidate := filepath.Join(p.DocsDir, "docs", "plan.json")
+		if _, err := os.Stat(candidate); err == nil {
+			planPath = candidate
+		}
 	}
-	if _, err := os.Stat(planPath); err != nil {
-		res.Errors = append(res.Errors, fmt.Sprintf("docs/plan.json missing in project docs (%s): %v", planPath, err))
+	if planPath == "" {
+		// Fallback to any registered plan.json.
+		for _, d := range p.Docs {
+			if filepath.Base(d) == "plan.json" {
+				if _, err := os.Stat(d); err == nil {
+					planPath = d
+					break
+				}
+			}
+		}
+	}
+	if planPath == "" {
+		res.Errors = append(res.Errors, "docs/plan.json missing: no worktree or registered plan.json found")
 		res.Passed = false
 		return res, nil
 	}

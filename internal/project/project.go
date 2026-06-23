@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"control-room/internal/store"
@@ -22,6 +23,7 @@ type Project struct {
 	Rules       []string `json:"rules" yaml:"rules"`
 	TestCommand string   `json:"test_command,omitempty" yaml:"test_command,omitempty"`
 	LintCommand string   `json:"lint_command,omitempty" yaml:"lint_command,omitempty"`
+	BaseCommit  string   `json:"base_commit,omitempty" yaml:"base_commit,omitempty"`
 	CreatedAt   string   `json:"created_at" yaml:"created_at"`
 }
 
@@ -47,8 +49,23 @@ func Create(st *store.Store, p *Project) error {
 		if err := ensureRepoHasCommit(p.RepoPath); err != nil {
 			return fmt.Errorf("repo setup failed: %w", err)
 		}
+		if p.BaseCommit == "" {
+			p.BaseCommit = currentHead(p.RepoPath)
+		}
 	}
 	return st.WriteJSON([]string{"projects", p.ID + ".json"}, p)
+}
+
+// currentHead returns the current HEAD commit hash, or "" if unavailable.
+func currentHead(repoPath string) string {
+	if repoPath == "" {
+		return ""
+	}
+	out, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // ensureRepoHasCommit creates an empty initial commit if the repo has no commits yet.
@@ -66,6 +83,10 @@ func Get(st *store.Store, id string) (*Project, error) {
 	var p Project
 	err := st.ReadJSON([]string{"projects", id + ".json"}, &p)
 	return &p, err
+}
+
+func Update(st *store.Store, p *Project) error {
+	return st.WriteJSON([]string{"projects", p.ID + ".json"}, p)
 }
 
 func List(st *store.Store) ([]Project, error) {
