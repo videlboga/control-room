@@ -1,0 +1,54 @@
+{{template "layout" .}}
+{{define "title"}}Agents{{end}}
+{{define "content"}}
+<h1>Agents</h1>
+{{range .Teams}}
+<div class="card">
+	<h2>{{.Name}} ({{.ID}})</h2>
+	<table>
+		<tr><th>Name</th><th>Role</th><th>Profile</th><th>Action</th></tr>
+		{{range $name, $agent := .Agents}}
+		<tr>
+			<td>{{$name}}</td>
+			<td>{{.Role}}</td>
+			<td>{{.Profile}}</td>
+			<td>
+				<form class="inline" method="post" action="/api/v1/agents/{{$.ID}}/{{$name}}" onsubmit="return confirm('Delete agent {{$name}}?')">
+					<input type="hidden" name="_method" value="DELETE">
+					<button type="submit">Delete</button>
+				</form>
+			</td>
+		</tr>
+		{{end}}
+	</table>
+	<h3>Add Agent</h3>
+	<form method="post" action="/api/v1/agents" id="form-{{.ID}}">
+		<input type="hidden" name="team" value="{{.ID}}">
+		<input type="text" name="name" placeholder="name" required>
+		<input type="text" name="role" placeholder="role" required>
+		<input type="text" name="profile" placeholder="hermes profile" required>
+		<input type="text" name="clone_from" placeholder="clone from (optional)">
+		<button type="submit">Add</button>
+	</form>
+</div>
+{{end}}
+<script>
+document.querySelectorAll('form[id^="form-"]').forEach(function(form) {
+	form.addEventListener('submit', function(e) {
+		e.preventDefault();
+		const fd = new FormData(form);
+		const body = {};
+		fd.forEach((v,k)=>body[k]=v);
+		fetch('/api/v1/agents', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+			.then(r=>r.json()).then(()=>location.reload());
+	});
+});
+
+document.querySelectorAll('form.inline').forEach(function(form) {
+	form.addEventListener('submit', function(e) {
+		e.preventDefault();
+		fetch(form.action, {method:'DELETE'}).then(()=>location.reload());
+	});
+});
+</script>
+{{end}}

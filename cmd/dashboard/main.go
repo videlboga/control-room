@@ -14,6 +14,10 @@ func main() {
 	if root == "" {
 		root = "/home/cyberkitty/.control-room"
 	}
+	if err := dashboard.LoadTemplates(); err != nil {
+		slog.Error("failed to load templates", "err", err)
+		os.Exit(1)
+	}
 	st := store.New(root)
 	port := os.Getenv("PORT")
 	if port == "" {

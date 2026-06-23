@@ -1,0 +1,71 @@
+{{template "layout" .}}
+{{define "title"}}Tasks{{end}}
+{{define "content"}}
+<h1>Tasks</h1>
+<div class="card">
+	<h2>Create Task</h2>
+	<form id="create-task">
+		<select name="project_id" required>
+			{{range .Projects}}<option value="{{.ID}}">{{.Title}}</option>{{end}}
+		</select>
+		<select name="team_id" required>
+			{{range .Teams}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
+		</select>
+		<select name="type" required>
+			{{range .Types}}<option value="{{.}}">{{.}}</option>{{end}}
+		</select>
+		<input type="text" name="title" placeholder="title" required>
+		<textarea name="description" placeholder="description"></textarea>
+		<input type="text" name="specialization" placeholder="specialization">
+		<button type="submit">Create</button>
+	</form>
+</div>
+<div class="card">
+	<h2>Filters</h2>
+	<form method="get" class="filters">
+		<select name="project">
+			<option value="">All projects</option>
+			{{range .Projects}}<option value="{{.ID}}" {{if eq $.FilterProj .ID}}selected{{end}}>{{.Title}}</option>{{end}}
+		</select>
+		<select name="agent">
+			<option value="">All agents/teams</option>
+			{{range .Teams}}<option value="{{.ID}}" {{if eq $.FilterAgent .ID}}selected{{end}}>{{.Name}}</option>{{end}}
+		</select>
+		<select name="status">
+			<option value="">All statuses</option>
+			{{range .Statuses}}<option value="{{.}}" {{if eq $.FilterStatus .}}selected{{end}}>{{.}}</option>{{end}}
+		</select>
+		<select name="type">
+			<option value="">All types</option>
+			{{range .Types}}<option value="{{.}}" {{if eq $.FilterType .}}selected{{end}}>{{.}}</option>{{end}}
+		</select>
+		<button type="submit">Filter</button>
+		<a href="/tasks"><button type="button">Reset</button></a>
+	</form>
+</div>
+<div class="card">
+	<h2>Tasks ({{len .Tasks}})</h2>
+	<table>
+		<tr><th>ID</th><th>Title</th><th>Project</th><th>Type</th><th>Status</th></tr>
+		{{range .Tasks}}
+		<tr>
+			<td><a href="/tasks/{{.ID}}">{{.ID}}</a></td>
+			<td>{{.Title}}</td>
+			<td>{{.ProjectID}}</td>
+			<td>{{.Type}}</td>
+			<td><span class="badge badge-{{.Status}}">{{.Status}}</span></td>
+		</tr>
+		{{end}}
+	</table>
+</div>
+<script>
+document.getElementById('create-task').addEventListener('submit', function(e) {
+	e.preventDefault();
+	const fd = new FormData(this);
+	const body = {};
+	fd.forEach((v,k)=>body[k]=v);
+	fetch('/api/v1/tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+		.then(r=>r.json()).then(()=>location.reload());
+});
+</script>
+{{end}}

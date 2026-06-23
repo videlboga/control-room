@@ -1,88 +1,43 @@
 {{template "layout" .}}
 {{define "title"}}Control Room Dashboard{{end}}
 {{define "content"}}
+<h1>Dashboard</h1>
 <div class="grid">
 	<div class="card">
-		<h2>Projects</h2>
-		<table>
-			<tr><th>ID</th><th>Title</th><th>Team</th></tr>
-			{{range .Projects}}
-			<tr>
-				<td><a href="/projects/{{.ID}}">{{.ID}}</a></td>
-				<td>{{.Title}}</td>
-				<td class="small">{{.DefaultTeam}}</td>
-			</tr>
+		<h2>Active Runs</h2>
+		<div id="active-runs">
+			{{if .ActiveRuns}}
+				{{range .ActiveRuns}}
+				<div class="card" id="run-card-{{.ID}}">
+					<h3><a href="/runs/{{.ID}}">{{.ID}}</a></h3>
+					<p class="small">Project: {{.ProjectID}} | Task: {{.TaskID}} | Status: {{.Status}}</p>
+				</div>
+				{{end}}
+			{{else}}
+				<p class="muted">No active runs.</p>
 			{{end}}
-		</table>
+		</div>
 	</div>
 	<div class="card">
-		<h2>Teams</h2>
-		{{range .Teams}}
-		<p><strong>{{.Name}}</strong> ({{.ID}})</p>
+		<h2>Projects</h2>
 		<ul>
-			{{range $k, $v := .Agents}}
-			<li>{{$k}} — {{.Role}} ({{.Profile}})</li>
+			{{range .Projects}}
+			<li><a href="/projects/{{.ID}}">{{.Title}}</a> ({{.ID}})</li>
 			{{end}}
 		</ul>
-		{{end}}
 	</div>
 	<div class="card">
-		<h2>Epics</h2>
+		<h2>Recent Tasks</h2>
 		<table>
 			<tr><th>ID</th><th>Title</th><th>Status</th></tr>
-			{{range .Epics}}
+			{{range .Tasks}}
 			<tr>
-				<td><a href="/epics/{{.ID}}">{{.ID}}</a></td>
+				<td><a href="/tasks/{{.ID}}">{{.ID}}</a></td>
 				<td>{{.Title}}</td>
 				<td><span class="badge badge-{{.Status}}">{{.Status}}</span></td>
 			</tr>
 			{{end}}
 		</table>
 	</div>
-</div>
-<div class="card">
-	<h2>Recent Tasks</h2>
-	<table>
-		<tr><th>ID</th><th>Title</th><th>Type</th><th>Project</th><th>Status</th><th>Action</th></tr>
-		{{range .Tasks}}
-		<tr>
-			<td><a href="/tasks/{{.ID}}">{{.ID}}</a></td>
-			<td>{{.Title}}</td>
-			<td>{{.Type}}</td>
-			<td>{{.ProjectID}}</td>
-			<td><span class="badge badge-{{.Status}}">{{.Status}}</span></td>
-			<td>
-				{{if or (eq .Status "open") (eq .Status "rejected")}}
-				<form method="post" action="/api/tasks/{{.ID}}/run" style="display:inline">
-					<button type="submit">Run</button>
-				</form>
-				{{end}}
-			</td>
-		</tr>
-		{{end}}
-	</table>
-</div>
-<div class="card">
-	<h2>Recent Runs</h2>
-	<table>
-		<tr><th>ID</th><th>Task</th><th>Agent</th><th>Step</th><th>Status</th><th>Started</th><th>Action</th></tr>
-		{{range .Runs}}
-		<tr>
-			<td><a href="/runs/{{.ID}}">{{.ID}}</a></td>
-			<td>{{.TaskID}}</td>
-			<td>{{.Agent}}</td>
-			<td>{{.Step}}</td>
-			<td>{{.Status}}</td>
-			<td>{{.StartedAt | formatTime}}</td>
-			<td>
-				{{if or (eq .Status "running") (eq .Status "pending")}}
-				<form method="post" action="/api/runs/{{.ID}}/cancel" style="display:inline">
-					<button type="submit">Cancel</button>
-				</form>
-				{{end}}
-			</td>
-		</tr>
-		{{end}}
-	</table>
 </div>
 {{end}}

@@ -1,0 +1,45 @@
+{{template "layout" .}}
+{{define "title"}}Projects{{end}}
+{{define "content"}}
+<h1>Projects</h1>
+<div class="card">
+	<h2>Create Project</h2>
+	<form id="create-project">
+		<input type="text" name="id" placeholder="id" required>
+		<input type="text" name="title" placeholder="title" required>
+		<input type="text" name="repo_path" placeholder="repo path" required>
+		<select name="default_team" required>
+			{{range .Teams}}
+				<option value="{{.ID}}">{{.Name}}</option>
+			{{end}}
+		</select>
+		<input type="text" name="test_command" placeholder="test command">
+		<input type="text" name="lint_command" placeholder="lint command">
+		<button type="submit">Create</button>
+	</form>
+</div>
+<div class="card">
+	<h2>All Projects</h2>
+	<table>
+		<tr><th>ID</th><th>Title</th><th>Repo</th><th>Team</th></tr>
+		{{range .Projects}}
+		<tr>
+			<td><a href="/projects/{{.ID}}">{{.ID}}</a></td>
+			<td>{{.Title}}</td>
+			<td class="small">{{.RepoPath}}</td>
+			<td>{{.DefaultTeam}}</td>
+		</tr>
+		{{end}}
+	</table>
+</div>
+<script>
+document.getElementById('create-project').addEventListener('submit', function(e) {
+	e.preventDefault();
+	const fd = new FormData(this);
+	const body = {};
+	fd.forEach((v,k)=>body[k]=v);
+	fetch('/api/v1/projects', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+		.then(r=>r.json()).then(()=>location.reload());
+});
+</script>
+{{end}}

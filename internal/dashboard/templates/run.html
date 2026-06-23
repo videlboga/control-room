@@ -1,22 +1,22 @@
 {{template "layout" .}}
 {{define "title"}}Run {{.Run.ID}}{{end}}
 {{define "content"}}
+<h1>Run {{.Run.ID}}</h1>
 <div class="card">
-	<h2>Run {{.Run.ID}}</h2>
-	<p class="small">Task: <a href="/tasks/{{.Run.TaskID}}">{{.Run.TaskID}}</a> | Agent: {{.Run.Agent}} | Step: {{.Run.Step}} | Status: {{.Run.Status}}</p>
-	{{if or (eq .Run.Status "running") (eq .Run.Status "pending")}}
-	<form method="post" action="/api/runs/{{.Run.ID}}/cancel">
-		<button type="submit">Cancel</button>
-	</form>
-	{{end}}
-	<h3>Activity Log</h3>
-	<div style="background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:0.75rem;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:0.8rem;max-height:500px;overflow:auto;">
-		{{range .Events}}
-		<div style="margin-bottom:0.5rem;">
-			<span class="small">{{.Timestamp}}</span> <strong>{{.Agent}}</strong> <span class="small">{{.Type}}</span> {{.Step}} {{.Tool}}
-			<div>{{.Payload}}</div>
-		</div>
-		{{end}}
+	<p><strong>Task:</strong> <a href="/tasks/{{.Run.TaskID}}">{{.Run.TaskID}}</a></p>
+	<p><strong>Project:</strong> {{.Run.ProjectID}}</p>
+	<p><strong>Agent:</strong> {{.Run.Agent}}</p>
+	<p><strong>Step:</strong> {{.Run.Step}}</p>
+	<p><strong>Status:</strong> {{.Run.Status}}</p>
+	<p><strong>Worktree:</strong> <span class="small">{{.Run.Worktree}}</span></p>
+</div>
+<div class="card">
+	<h2>Activity Log</h2>
+	{{range .Events}}
+	<div class="log-line">
+		<span class="log-time">{{.Timestamp}}</span> <strong>{{.Agent}}</strong> {{.Type}} {{.Step}} {{.Tool}}
+		<div>{{.Payload}}</div>
 	</div>
+	{{end}}
 </div>
 {{end}}
