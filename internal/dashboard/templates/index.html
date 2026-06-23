@@ -1,25 +1,25 @@
 {{template "layout" .}}
-{{define "title"}}Control Room Dashboard{{end}}
+{{define "title"}}Панель управления{{end}}
 {{define "content"}}
-<h1>Dashboard</h1>
+<h1>Панель управления</h1>
 <div class="grid">
 	<div class="card">
-		<h2>Active Runs</h2>
+		<h2>Активные запуски</h2>
 		<div id="active-runs">
 			{{if .ActiveRuns}}
 				{{range .ActiveRuns}}
 				<div class="card" id="run-card-{{.ID}}">
 					<h3><a href="/runs/{{.ID}}">{{.ID}}</a></h3>
-					<p class="small">Project: {{.ProjectID}} | Task: {{.TaskID}} | Status: {{.Status}}</p>
+					<p class="small">Проект: {{.ProjectID}} | Задача: {{.TaskID}} | Статус: {{.Status}}</p>
 				</div>
 				{{end}}
 			{{else}}
-				<p class="muted">No active runs.</p>
+				<p class="muted">Нет активных запусков.</p>
 			{{end}}
 		</div>
 	</div>
 	<div class="card">
-		<h2>Projects</h2>
+		<h2>Проекты</h2>
 		<ul>
 			{{range .Projects}}
 			<li><a href="/projects/{{.ID}}">{{.Title}}</a> ({{.ID}})</li>
@@ -27,9 +27,9 @@
 		</ul>
 	</div>
 	<div class="card">
-		<h2>Recent Tasks</h2>
+		<h2>Последние задачи</h2>
 		<table>
-			<tr><th>ID</th><th>Title</th><th>Status</th></tr>
+			<tr><th>ID</th><th>Название</th><th>Статус</th></tr>
 			{{range .Tasks}}
 			<tr>
 				<td><a href="/tasks/{{.ID}}">{{.ID}}</a></td>

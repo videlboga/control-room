@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -90,6 +91,7 @@ func New(st *store.Store) http.Handler {
 	mux.HandleFunc("/api/v1/tasks", s.apiTasks)
 	mux.HandleFunc("/api/v1/runs/active", s.apiActiveRuns)
 	mux.HandleFunc("/api/v1/runs/{id}", s.apiRunDetail)
+	mux.HandleFunc("/api/v1/runs/{id}/agent-log", s.apiAgentLog)
 	mux.HandleFunc("/api/v1/events", s.eventsSSE)
 
 	return mux
@@ -454,6 +456,18 @@ func (s *Server) apiRunDetail(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, map[string]any{"run": rn, "events": events})
 }
 
+func (s *Server) apiAgentLog(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	last := 50
+	if n := r.URL.Query().Get("n"); n != "" {
+		if parsed, err := strconv.Atoi(n); err == nil {
+			last = parsed
+		}
+	}
+	lines, _ := s.store.AgentLog(id, last)
+	jsonResponse(w, lines)
+}
+
 type sseClient chan string
 
 type Broadcaster struct {
@@ -546,21 +560,28 @@ func (s *Server) sendEventsSnapshot(w http.ResponseWriter, flusher http.Flusher)
 	}
 
 	type card struct {
-		RunID   string      `json:"run_id"`
-		Project string      `json:"project"`
-		Task    string      `json:"task"`
-		Status  string      `json:"status"`
-		Events  []run.Event `json:"events"`
+		RunID    string      `json:"run_id"`
+		Project  string      `json:"project"`
+		Task     string      `json:"task"`
+		Status   string      `json:"status"`
+		Agent    string      `json:"agent"`
+		Step     string      `json:"step"`
+		Events   []run.Event `json:"events"`
+		AgentLog []string    `json:"agent_log"`
 	}
 	var cards []card
 	for _, r := range active {
 		events, _ := s.store.RecentRunEvents(r.ID, 20)
+		agentLog, _ := s.store.AgentLog(r.ID, 20)
 		cards = append(cards, card{
-			RunID:   r.ID,
-			Project: projectMap[r.ProjectID],
-			Task:    taskMap[r.TaskID],
-			Status:  r.Status,
-			Events:  events,
+			RunID:    r.ID,
+			Project:  projectMap[r.ProjectID],
+			Task:     taskMap[r.TaskID],
+			Status:   r.Status,
+			Agent:    r.Agent,
+			Step:     r.Step,
+			Events:   events,
+			AgentLog: agentLog,
 		})
 	}
 	data, _ := json.Marshal(map[string]any{"active_runs": cards})

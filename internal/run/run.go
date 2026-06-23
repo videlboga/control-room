@@ -690,7 +690,8 @@ func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns in
 			outBuf.WriteString(line)
 			outBuf.WriteByte('\n')
 			outMu.Unlock()
-			act.write("line")
+			act.write("%s", line)
+			_ = appendAgentLog(activityPath, line)
 		}
 	}
 	wg.Add(2)
@@ -711,6 +712,19 @@ func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns in
 		return cleanHermesOutput(outBuf.String()), fmt.Errorf("hermes exited: %w\n%s", err, outBuf.String())
 	}
 	return cleanHermesOutput(outBuf.String()), nil
+}
+
+
+// appendAgentLog writes a timestamped line to the run agent log.
+func appendAgentLog(activityPath, line string) error {
+	logPath := filepath.Join(filepath.Dir(activityPath), "agent.log")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "[%s] %s\n", time.Now().UTC().Format(time.RFC3339), line)
+	return err
 }
 
 // monitorHermesActivity polls the activity log mtime. If it has not changed for

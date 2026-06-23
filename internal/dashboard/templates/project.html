@@ -1,23 +1,23 @@
 {{template "layout" .}}
-{{define "title"}}Project {{.Project.ID}}{{end}}
+{{define "title"}}Проект {{.Project.ID}}{{end}}
 {{define "content"}}
 <h1>{{.Project.Title}}</h1>
 <div class="card">
 	<p><strong>ID:</strong> {{.Project.ID}}</p>
-	<p><strong>Repo:</strong> {{.Project.RepoPath}}</p>
-	<p><strong>Team:</strong> {{.Project.DefaultTeam}}</p>
+	<p><strong>Репозиторий:</strong> {{.Project.RepoPath}}</p>
+	<p><strong>Команда:</strong> {{.Project.DefaultTeam}}</p>
 	<p><strong>Base Commit:</strong> {{.Project.BaseCommit}}</p>
-	<p><strong>Docs:</strong> {{range .Project.Docs}}<span class="small">{{.}}</span> {{end}}</p>
-	<h3>Add Doc</h3>
+	<p><strong>Документы:</strong> {{range .Project.Docs}}<span class="small">{{.}}</span> {{end}}</p>
+	<h3>Добавить документ</h3>
 	<form id="add-doc" enctype="multipart/form-data">
 		<input type="file" name="doc" required>
-		<button type="submit">Upload</button>
+		<button type="submit">Загрузить</button>
 	</form>
 </div>
 <div class="card">
-	<h2>Tasks</h2>
+	<h2>Задачи проекта</h2>
 	<table>
-		<tr><th>ID</th><th>Title</th><th>Type</th><th>Status</th></tr>
+		<tr><th>ID</th><th>Название</th><th>Тип</th><th>Статус</th></tr>
 		{{range .Tasks}}
 		<tr>
 			<td><a href="/tasks/{{.ID}}">{{.ID}}</a></td>

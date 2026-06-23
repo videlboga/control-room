@@ -1,34 +1,33 @@
 {{template "layout" .}}
-{{define "title"}}Agents{{end}}
+{{define "title"}}Агенты{{end}}
 {{define "content"}}
-<h1>Agents</h1>
+<h1>Агенты</h1>
 {{range .Teams}}
 <div class="card">
 	<h2>{{.Name}} ({{.ID}})</h2>
 	<table>
-		<tr><th>Name</th><th>Role</th><th>Profile</th><th>Action</th></tr>
+		<tr><th>Имя</th><th>Роль</th><th>Профиль Hermes</th><th>Действие</th></tr>
 		{{range $name, $agent := .Agents}}
 		<tr>
 			<td>{{$name}}</td>
 			<td>{{.Role}}</td>
 			<td>{{.Profile}}</td>
 			<td>
-				<form class="inline" method="post" action="/api/v1/agents/{{$.ID}}/{{$name}}" onsubmit="return confirm('Delete agent {{$name}}?')">
-					<input type="hidden" name="_method" value="DELETE">
-					<button type="submit">Delete</button>
+				<form class="inline" method="post" action="/api/v1/agents/{{$.ID}}/{{$name}}" onsubmit="return confirm('Удалить агента {{$name}}?')">
+					<button type="submit">Удалить</button>
 				</form>
 			</td>
 		</tr>
 		{{end}}
 	</table>
-	<h3>Add Agent</h3>
+	<h3>Добавить агента</h3>
 	<form method="post" action="/api/v1/agents" id="form-{{.ID}}">
 		<input type="hidden" name="team" value="{{.ID}}">
-		<input type="text" name="name" placeholder="name" required>
-		<input type="text" name="role" placeholder="role" required>
-		<input type="text" name="profile" placeholder="hermes profile" required>
-		<input type="text" name="clone_from" placeholder="clone from (optional)">
-		<button type="submit">Add</button>
+		<input type="text" name="name" placeholder="имя" required>
+		<input type="text" name="role" placeholder="роль" required>
+		<input type="text" name="profile" placeholder="профиль hermes" required>
+		<input type="text" name="clone_from" placeholder="клонировать из (опционально)">
+		<button type="submit">Добавить</button>
 	</form>
 </div>
 {{end}}

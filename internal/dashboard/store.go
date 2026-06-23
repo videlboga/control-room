@@ -1,7 +1,11 @@
 package dashboard
 
 import (
+	"os"
+	"io"
+	"path/filepath"
 	"sort"
+	"strings"
 
 	"control-room/internal/epic"
 	"control-room/internal/project"
@@ -91,6 +95,27 @@ func (ds *DashboardStore) ActiveRuns() ([]run.Run, error) {
 		return active[i].StartedAt > active[j].StartedAt
 	})
 	return active, nil
+}
+
+func (ds *DashboardStore) AgentLog(runID string, n int) ([]string, error) {
+	logPath := filepath.Join(ds.Root, "runs", runID, "agent.log")
+	f, err := os.Open(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+	lines, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Split(strings.TrimSuffix(string(lines), "\n"), "\n")
+	if len(parts) > n {
+		return parts[len(parts)-n:], nil
+	}
+	return parts, nil
 }
 
 func (ds *DashboardStore) RecentRunEvents(runID string, n int) ([]run.Event, error) {
