@@ -5,22 +5,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
-
-	"golang.org/x/sys/unix"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"control-room/internal/config"
 	"control-room/internal/project"
 	"control-room/internal/store"
 	"control-room/internal/task"
 	"control-room/internal/team"
-	"github.com/google/uuid"
 )
 
 // Run is a concrete task execution.
@@ -38,6 +37,7 @@ type Run struct {
 	Summary   string            `json:"summary,omitempty" yaml:"summary,omitempty"`
 	StartedAt string            `json:"started_at" yaml:"started_at"`
 	EndedAt   string            `json:"ended_at,omitempty" yaml:"ended_at,omitempty"`
+	PID       int               `json:"pid,omitempty" yaml:"pid,omitempty"`
 	Metadata  map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 }
 
@@ -169,31 +169,47 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 // seedWorktreeDocs copies project docs (e.g. RESEARCH.md, plan.json) into the run worktree
 // so that every agent can read the shared source of truth regardless of branch.
 func seedWorktreeDocs(st *store.Store, r *Run, p *project.Project, wt string) error {
-	if p.DocsDir == "" || wt == "" {
+	if wt == "" {
 		return nil
 	}
-	return filepath.Walk(p.DocsDir, func(src string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+	var sources []string
+	if p.DocsDir != "" {
+		sources = append(sources, p.DocsDir)
+	}
+	if p.RepoPath != "" {
+		sources = append(sources, p.RepoPath)
+	}
+	for _, srcDir := range sources {
+		if err := filepath.Walk(srcDir, func(src string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return err
+			}
+			rel, err := filepath.Rel(srcDir, src)
+			if err != nil {
+				return err
+			}
+			base := filepath.Base(rel)
+			if base != "RESEARCH.md" && base != "plan.json" && !strings.HasPrefix(rel, "docs") {
+				return nil
+			}
+			dst := filepath.Join(wt, rel)
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				return err
+			}
+			data, err := os.ReadFile(src)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(dst, data, 0o644); err != nil {
+				return err
+			}
+			_ = logEvent(st, r, "system", "info", "", "seeded doc "+rel)
+			return nil
+		}); err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(p.DocsDir, src)
-		if err != nil {
-			return err
-		}
-		dst := filepath.Join(wt, rel)
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return err
-		}
-		data, err := os.ReadFile(src)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(dst, data, 0o644); err != nil {
-			return err
-		}
-		_ = logEvent(st, r, "system", "info", "", "seeded doc "+rel)
-		return nil
-	})
+	}
+	return nil
 }
 
 // Get loads a run by id.
@@ -300,6 +316,18 @@ func Cancel(st *store.Store, id string) error {
 	if r.Status == "done" || r.Status == "failed" || r.Status == "cancelled" {
 		return errors.New("run already finished")
 	}
+	if r.PID > 0 {
+		_ = logEvent(st, r, "system", "info", "", fmt.Sprintf("sending SIGTERM to hermes process %d", r.PID))
+		if proc, err := os.FindProcess(r.PID); err == nil {
+			_ = proc.Signal(syscall.SIGTERM)
+			go func() {
+				time.Sleep(10 * time.Second)
+				if proc2, err := os.FindProcess(r.PID); err == nil {
+					_ = proc2.Signal(syscall.SIGKILL)
+				}
+			}()
+		}
+	}
 	r.Status = "cancelled"
 	r.EndedAt = time.Now().UTC().Format(time.RFC3339)
 	_ = logEvent(st, r, "system", "info", "", "run cancelled by user")
@@ -338,7 +366,11 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 	if t.Type == task.TypeEngineering {
 		maxTurns = 120
 	}
-	out, err := runHermes(user, profile, prompt, r.Worktree, filepath.Join(st.Root, "runs", r.ID, "activity.log"), maxTurns)
+	activityPath := filepath.Join(st.Root, "runs", r.ID, "activity.log")
+	out, err := runHermes(user, profile, prompt, r.Worktree, activityPath, maxTurns, func(pid int) {
+		r.PID = pid
+		_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
+	})
 	hermesFailed := err != nil
 	if hermesFailed {
 		r.Errors++
@@ -461,7 +493,7 @@ func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 			_ = project.AddDoc(st, p.ID, wtPath)
 		}
 	case task.TypeQAVerify:
-		// First QA verification attempt is rejected to exercise the redo path.
+		// First QA verification attempt is rejected to exercise the engineering redo path.
 		if t.RedoIndex == 0 {
 			verdict = "reject"
 			reason = "stub: first QA verification rejected to test redo"
@@ -469,17 +501,17 @@ func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 				"verdict": "reject",
 				"reason":  reason,
 			})
-		} else {
-			// Write a fake diff and review note so gate checks pass.
-			if r.Worktree != "" {
-				_ = writeStubDiff(r.Worktree, "qa-verify")
-			}
-			_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, map[string]string{
-				"verdict":        "approve",
-				"reason":         "stub QA verify passed",
-				"qa_review_note": "- checked diff exists\n- checked unit tests\n- checked lint clean",
-			})
+			break
 		}
+		// Write a fake diff and review note so gate checks pass.
+		if r.Worktree != "" {
+			_ = writeStubDiff(r.Worktree, "qa-verify")
+		}
+		_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, map[string]string{
+			"verdict":        "approve",
+			"reason":         "stub QA verify passed",
+			"qa_review_note": "- checked diff exists\n- checked unit tests\n- checked lint clean",
+		})
 	case task.TypePMPlan:
 		// Generate a multi-task engineering plan with dependencies to test DAG expansion.
 		planDir := filepath.Join(r.Worktree, "docs")
@@ -504,6 +536,8 @@ func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 			"plan":    string(planJSON),
 		})
 	case task.TypeEngineering:
+		// Regular engineering tasks always approve in stub mode.
+		// (Redos created after a QA reject also approve so the workflow can finish.)
 		// Ensure the stub engineering run produces a compilable cmd entrypoint so gate checks pass.
 		if r.Worktree != "" {
 			cmdDir := filepath.Join(r.Worktree, "cmd", p.ID)
@@ -574,7 +608,7 @@ func TestGreet(t *testing.T) {
 
 // isProcessAlive checks whether a PID is still running on Linux.
 func isProcessAlive(pid int) bool {
-	return unix.Kill(pid, 0) == nil
+	return syscall.Kill(pid, 0) == nil
 }
 
 // acquireSlot claims one of N filesystem slots; returns the slot number (1..N).
@@ -638,7 +672,7 @@ func (a *activityWriter) write(format string, args ...interface{}) {
 	fmt.Fprintf(f, "[%s] "+format+"\n", append([]interface{}{time.Now().UTC().Format(time.RFC3339)}, args...)...)
 }
 
-func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns int) (string, error) {
+func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns int, setPID func(int)) (string, error) {
 	if maxTurns <= 0 {
 		maxTurns = 60
 	}
@@ -650,7 +684,6 @@ func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns in
 		"chat", "-q", prompt,
 		"--toolsets", "file,terminal",
 		"--yolo",
-		"--quiet",
 		"--source", "tool",
 		"--max-turns", fmt.Sprintf("%d", maxTurns),
 	}
@@ -676,6 +709,9 @@ func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns in
 	}
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("start hermes: %w", err)
+	}
+	if setPID != nil && cmd.Process != nil {
+		setPID(cmd.Process.Pid)
 	}
 
 	var wg sync.WaitGroup
@@ -857,9 +893,9 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 				"Run the project test command and lint command if available. " +
 				"If tests fail or acceptance criteria are not met, reject the task in your summary.\n")
 		default:
-			b.WriteString("\nMANDATORY: verify paths and files exist before referring to them. Use `ls`, `find`, or `git status` to confirm actual locations. Do not assume RESEARCH.md or docs/plan.json are in a specific directory; check first. Read RESEARCH.md and docs/plan.json in this worktree. " +
-				"Follow the stack, architecture and acceptance criteria from RESEARCH.md exactly. " +
-				"If either file is missing or the stack is unclear, reject the task in your summary.\n")
+			b.WriteString("\nRead RESEARCH.md and docs/plan.json in this worktree if they exist; use them as guidance. " +
+				"Follow the stack, architecture and acceptance criteria from RESEARCH.md when available. " +
+				"If these files are missing, proceed using the task description and produce a small, correct implementation. Do not reject solely because documentation is missing.\n")
 		}
 	}
 	if len(previous) > 0 {
@@ -874,6 +910,9 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 		}
 	}
 	b.WriteString(fmt.Sprintf("\nPerform the '%s' step and report a concise summary of what you did.", step))
+	b.WriteString("\n\nIMPORTANT: throughout your response, include a brief reasoning block before every significant decision or tool call. " +
+		"Wrap each reasoning in XML-like tags: <reasoning>your short reasoning here</reasoning>. " +
+		"These reasoning blocks will be captured in the run log for transparency. Keep reasoning concise (1-2 sentences).")
 	b.WriteString("\n\nAt the very end of your response, on its own line, you MUST output exactly one of:\n")
 	b.WriteString("verdict: approve\n")
 	b.WriteString("or\n")

@@ -409,10 +409,8 @@ func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{}))
 						cb("plan_doc_error", ready.ID, err)
 					}
 				}
-				if ready.Type == task.TypeEngineering {
-					if err := o.mergeApprovedWorktree(ready); err != nil {
-						cb("merge_error", ready.ID, err)
-					}
+				if err := o.mergeApprovedWorktree(ready); err != nil {
+					cb("merge_error", ready.ID, err)
 				}
 				if nextType == "" || nextType == task.TypeQAVerify {
 					cb("task_done", ready.ID)
@@ -597,10 +595,19 @@ func (o *Orchestrator) copyPlanDoc(pmTask *task.Task) error {
 		return err
 	}
 	runs, err := run.ListByTask(o.Store, pmTask.ID)
-	if err != nil || len(runs) == 0 {
+	if err != nil {
+		return err
+	}
+	var wt string
+	for i := len(runs) - 1; i >= 0; i-- {
+		if runs[i].ProjectID == pmTask.ProjectID {
+			wt = runs[i].Worktree
+			break
+		}
+	}
+	if wt == "" {
 		return errors.New("no run for PM plan task")
 	}
-	wt := runs[0].Worktree
 	if wt == "" {
 		return errors.New("PM plan run has no worktree")
 	}
@@ -646,10 +653,19 @@ func (o *Orchestrator) copyResearchDoc(researchTask *task.Task) error {
 		return err
 	}
 	runs, err := run.ListByTask(o.Store, researchTask.ID)
-	if err != nil || len(runs) == 0 {
+	if err != nil {
+		return err
+	}
+	var wt string
+	for i := len(runs) - 1; i >= 0; i-- {
+		if runs[i].ProjectID == researchTask.ProjectID {
+			wt = runs[i].Worktree
+			break
+		}
+	}
+	if wt == "" {
 		return errors.New("no run for research task")
 	}
-	wt := runs[0].Worktree
 	if wt == "" {
 		return errors.New("research run has no worktree")
 	}
@@ -718,10 +734,22 @@ func (o *Orchestrator) mergeApprovedWorktree(t *task.Task) error {
 	if err != nil || len(runs) == 0 {
 		return errors.New("no run for engineering task")
 	}
-	// Use the latest finished run for this task.
-	r := runs[len(runs)-1]
-	if r.Branch == "" {
+	// Use the latest finished run for this task in the same project.
+	var r *run.Run
+	for i := len(runs) - 1; i >= 0; i-- {
+		if runs[i].ProjectID == t.ProjectID {
+			r = &runs[i]
+			break
+		}
+	}
+	if r == nil || r.Branch == "" || r.Worktree == "" {
 		return nil
+	}
+	// Pull any new files from the worktree back into the branch so the merge
+	// includes everything the agent produced, even uncommitted changes.
+	_ = exec.Command("git", "-C", r.Worktree, "add", "-A").Run()
+	if _, err := exec.Command("git", "-C", r.Worktree, "diff", "--cached", "--quiet").CombinedOutput(); err != nil {
+		_ = exec.Command("git", "-C", r.Worktree, "commit", "-m", fmt.Sprintf("agent: %s %s", t.Type, t.ID)).Run()
 	}
 	// Fast-forward main to the approved branch when possible; otherwise merge.
 	out, err := exec.Command("git", "-C", proj.RepoPath, "merge", "--ff-only", r.Branch).CombinedOutput()
