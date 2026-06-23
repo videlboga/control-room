@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"os/user"
 	"path/filepath"
 
 	"gopkg.in/yaml.v3"
@@ -17,17 +18,47 @@ type WorkspaceConfig struct {
 }
 
 const (
-	DefaultHermesUser          = "cyberkitty"
 	DefaultHermesSourceProfile = "qwen8"
 	DefaultMaxConcurrentRuns   = 4
 )
+
+// DefaultHermesUser returns the user that owns Hermes profiles.
+// It respects CONTROL_ROOM_HERMES_USER, then the current USER, then the
+// effective username reported by the OS. This avoids hard-coding a specific
+// account.
+func DefaultHermesUser() string {
+	if u := os.Getenv("CONTROL_ROOM_HERMES_USER"); u != "" {
+		return u
+	}
+	if u := os.Getenv("USER"); u != "" {
+		return u
+	}
+	u, _ := user.Current()
+	if u != nil {
+		return u.Username
+	}
+	return ""
+}
+
+// DefaultWorkspace returns a default workspace root.
+// It respects CONTROL_ROOM_WORKSPACE, then $HOME/.control-room.
+func DefaultWorkspace() string {
+	if w := os.Getenv("CONTROL_ROOM_WORKSPACE"); w != "" {
+		return w
+	}
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		return filepath.Join(home, ".control-room")
+	}
+	return "/tmp/control-room"
+}
 
 // LoadOrCreate loads workspace.yaml or creates defaults.
 func LoadOrCreate(root string) (*WorkspaceConfig, error) {
 	cfgPath := filepath.Join(root, "workspace.yaml")
 	cfg := &WorkspaceConfig{
 		Root:                root,
-		HermesUser:          DefaultHermesUser,
+		HermesUser:          DefaultHermesUser(),
 		HermesSourceProfile: DefaultHermesSourceProfile,
 		MaxConcurrentRuns:   DefaultMaxConcurrentRuns,
 	}
@@ -49,7 +80,7 @@ func LoadOrCreate(root string) (*WorkspaceConfig, error) {
 	// Fill defaults for older configs.
 	changed := false
 	if cfg.HermesUser == "" {
-		cfg.HermesUser = DefaultHermesUser
+		cfg.HermesUser = DefaultHermesUser()
 		changed = true
 	}
 	if cfg.HermesSourceProfile == "" {

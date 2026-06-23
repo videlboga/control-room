@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"control-room/internal/config"
 	"control-room/internal/store"
 )
 
@@ -120,7 +121,7 @@ func ensureAgentProfiles(st *store.Store, t *Team) error {
 	}
 	user := st.HermesUser
 	if user == "" {
-		user = "cyberkitty"
+		user = config.DefaultHermesUser()
 	}
 
 	for name, ref := range t.Agents {

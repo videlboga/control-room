@@ -73,7 +73,7 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 
 	user := st.HermesUser
 	if user == "" {
-		user = "cyberkitty"
+		user = config.DefaultHermesUser()
 	}
 
 	runID := "run_" + uuid.New().String()[:8]
@@ -353,7 +353,7 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 
 	user := st.HermesUser
 	if user == "" {
-		user = "cyberkitty"
+		user = config.DefaultHermesUser()
 	}
 
 	r.Agent = agentName
