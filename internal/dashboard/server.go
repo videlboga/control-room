@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"control-room/internal/epic"
 	"control-room/internal/project"
 	"control-room/internal/run"
 	"control-room/internal/store"
@@ -51,7 +52,7 @@ func LoadTemplates() error {
 		},
 	}
 	pageTemplates = map[string]*template.Template{}
-	pages := []string{"index", "agents", "projects", "project", "tasks", "task", "run"}
+	pages := []string{"index", "agents", "projects", "project", "epics", "tasks", "task", "run"}
 	for _, page := range pages {
 		t, err := template.New("layout").Funcs(funcMap).ParseFS(templatesFS,
 			"templates/layout.html",
@@ -79,6 +80,7 @@ func New(st *store.Store) http.Handler {
 	mux.HandleFunc("/agents", s.agentsPage)
 	mux.HandleFunc("/projects", s.projectsPage)
 	mux.HandleFunc("/projects/{id}", s.projectDetailPage)
+	mux.HandleFunc("/epics", s.epicsPage)
 	mux.HandleFunc("/tasks", s.tasksPage)
 	mux.HandleFunc("/tasks/{id}", s.taskDetailPage)
 	mux.HandleFunc("/runs/{id}", s.runDetailPage)
@@ -88,6 +90,7 @@ func New(st *store.Store) http.Handler {
 	mux.HandleFunc("/api/v1/projects", s.apiProjects)
 	mux.HandleFunc("/api/v1/projects/{id}", s.apiProjectDetail)
 	mux.HandleFunc("/api/v1/projects/{id}/docs", s.apiProjectDoc)
+	mux.HandleFunc("/api/v1/epics", s.apiEpics)
 	mux.HandleFunc("/api/v1/tasks", s.apiTasks)
 	mux.HandleFunc("/api/v1/runs/active", s.apiActiveRuns)
 	mux.HandleFunc("/api/v1/runs/{id}", s.apiRunDetail)
@@ -161,6 +164,12 @@ func (s *Server) projectDetailPage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	render(w, "project", map[string]any{"Project": p, "Tasks": projectTasks})
+}
+
+func (s *Server) epicsPage(w http.ResponseWriter, r *http.Request) {
+	projects, _ := s.store.ListProjects()
+	epics, _ := s.store.ListEpics()
+	render(w, "epics", map[string]any{"Projects": projects, "Epics": epics})
 }
 
 func (s *Server) tasksPage(w http.ResponseWriter, r *http.Request) {
@@ -305,6 +314,44 @@ func (s *Server) apiProjects(w http.ResponseWriter, r *http.Request) {
 	default:
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) apiEpics(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		epics, _ := s.store.ListEpics()
+		jsonResponse(w, epics)
+	case http.MethodPost:
+		s.apiEpicCreate(w, r)
+	default:
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) apiEpicCreate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		ProjectID   string `json:"project_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	e := &epic.Epic{
+		Title:       req.Title,
+		Description: req.Description,
+		ProjectID:   req.ProjectID,
+		Status:      "open",
+	}
+	e, err := epic.Create(s.store.Store, e)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.eventsBroadcaster.Notify()
+	w.WriteHeader(http.StatusCreated)
+	jsonResponse(w, e)
 }
 
 func (s *Server) apiProjectCreate(w http.ResponseWriter, r *http.Request) {
