@@ -1,0 +1,21 @@
+{{template "layout" .}}
+{{define "title"}}Epic {{.Epic.ID}}{{end}}
+{{define "content"}}
+<div class="card">
+	<h2>{{.Epic.Title}}</h2>
+	<p class="small">ID: {{.Epic.ID}} | Project: {{.Epic.ProjectID}} | Status: <span class="badge badge-{{.Epic.Status}}">{{.Epic.Status}}</span></p>
+	<p>{{.Epic.Description}}</p>
+	<h3>Tasks</h3>
+	<table>
+		<tr><th>ID</th><th>Title</th><th>Type</th><th>Status</th></tr>
+		{{range .Tasks}}
+		<tr>
+			<td><a href="/tasks/{{.ID}}">{{.ID}}</a></td>
+			<td>{{.Title}}</td>
+			<td>{{.Type}}</td>
+			<td><span class="badge badge-{{.Status}}">{{.Status}}</span></td>
+		</tr>
+		{{end}}
+	</table>
+</div>
+{{end}}

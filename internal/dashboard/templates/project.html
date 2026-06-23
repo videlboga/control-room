@@ -1,0 +1,20 @@
+{{template "layout" .}}
+{{define "title"}}Project {{.Project.ID}}{{end}}
+{{define "content"}}
+<div class="card">
+	<h2>{{.Project.Title}}</h2>
+	<p class="small">ID: {{.Project.ID}} | Repo: {{.Project.RepoPath}} | Base: {{.Project.BaseCommit}}</p>
+	<h3>Tasks</h3>
+	<table>
+		<tr><th>ID</th><th>Title</th><th>Type</th><th>Status</th></tr>
+		{{range .Tasks}}
+		<tr>
+			<td><a href="/tasks/{{.ID}}">{{.ID}}</a></td>
+			<td>{{.Title}}</td>
+			<td>{{.Type}}</td>
+			<td><span class="badge badge-{{.Status}}">{{.Status}}</span></td>
+		</tr>
+		{{end}}
+	</table>
+</div>
+{{end}}

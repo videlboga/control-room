@@ -1,0 +1,35 @@
+{{template "layout" .}}
+{{define "title"}}Task {{.Task.ID}}{{end}}
+{{define "content"}}
+<div class="card">
+	<h2>{{.Task.Title}}</h2>
+	<p class="small">ID: {{.Task.ID}} | Type: {{.Task.Type}} | Project: {{.Task.ProjectID}} | Epic: {{.Task.EpicID}}</p>
+	<p>Status: <span class="badge badge-{{.Task.Status}}">{{.Task.Status}}</span></p>
+	<p>{{.Task.Description}}</p>
+	{{if or (eq .Task.Status "open") (eq .Task.Status "rejected")}}
+	<form method="post" action="/api/tasks/{{.Task.ID}}/run">
+		<button type="submit">Start Run</button>
+	</form>
+	{{end}}
+	<h3>Runs</h3>
+	<table>
+		<tr><th>ID</th><th>Agent</th><th>Step</th><th>Status</th><th>Started</th><th>Action</th></tr>
+		{{range .Runs}}
+		<tr>
+			<td><a href="/runs/{{.ID}}">{{.ID}}</a></td>
+			<td>{{.Agent}}</td>
+			<td>{{.Step}}</td>
+			<td>{{.Status}}</td>
+			<td>{{.StartedAt | formatTime}}</td>
+			<td>
+				{{if or (eq .Status "running") (eq .Status "pending")}}
+				<form method="post" action="/api/runs/{{.ID}}/cancel" style="display:inline">
+					<button type="submit">Cancel</button>
+				</form>
+				{{end}}
+			</td>
+		</tr>
+		{{end}}
+	</table>
+</div>
+{{end}}
