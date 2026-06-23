@@ -749,14 +749,21 @@ func (o *Orchestrator) mergeApprovedWorktree(t *task.Task) error {
 	// includes everything the agent produced, even uncommitted changes.
 	_ = exec.Command("git", "-C", r.Worktree, "add", "-A").Run()
 	if _, err := exec.Command("git", "-C", r.Worktree, "diff", "--cached", "--quiet").CombinedOutput(); err != nil {
-		_ = exec.Command("git", "-C", r.Worktree, "commit", "-m", fmt.Sprintf("agent: %s %s", t.Type, t.ID)).Run()
+		if out, err := exec.Command("git", "-C", r.Worktree, "commit", "-m", fmt.Sprintf("agent: %s %s", t.Type, t.ID)).CombinedOutput(); err != nil {
+			return fmt.Errorf("commit worktree failed: %w\n%s", err, out)
+		}
 	}
-	// Fast-forward main to the approved branch when possible; otherwise merge.
+	// Fast-forward main to the approved branch when possible.
 	out, err := exec.Command("git", "-C", proj.RepoPath, "merge", "--ff-only", r.Branch).CombinedOutput()
 	if err != nil {
-		out, err = exec.Command("git", "-C", proj.RepoPath, "merge", "-Xtheirs", "-m", "merge "+t.ID, r.Branch).CombinedOutput()
+		// main has moved on; rebase the approved branch onto main and try ff-only again.
+		if rb, err := exec.Command("git", "-C", r.Worktree, "rebase", "main").CombinedOutput(); err != nil {
+			_ = exec.Command("git", "-C", r.Worktree, "rebase", "--abort").Run()
+			return fmt.Errorf("rebase worktree onto main failed: %w\n%s", err, rb)
+		}
+		out, err = exec.Command("git", "-C", proj.RepoPath, "merge", "--ff-only", r.Branch).CombinedOutput()
 		if err != nil {
-			return fmt.Errorf("merge failed: %w\n%s", err, out)
+			return fmt.Errorf("merge failed after rebase: %w\n%s", err, out)
 		}
 	}
 	// Update project base commit so that new worktrees start from the merged state.
