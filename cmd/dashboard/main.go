@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 
+	"control-room/internal/config"
 	"control-room/internal/dashboard"
 	"control-room/internal/store"
 )
@@ -12,7 +13,7 @@ import (
 func main() {
 	root := os.Getenv("CONTROL_ROOM_WORKSPACE")
 	if root == "" {
-		root = "/home/cyberkitty/.control-room"
+		root = config.DefaultWorkspace()
 	}
 	if err := dashboard.LoadTemplates(); err != nil {
 		slog.Error("failed to load templates", "err", err)

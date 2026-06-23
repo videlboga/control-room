@@ -32,7 +32,7 @@ func NewRootCmd() *cobra.Command {
 		Short: "Hermes Workspace -- lightweight project/team/run orchestrator",
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			if root == "" {
-				root = "/home/cyberkitty/.control-room"
+				root = config.DefaultWorkspace()
 			}
 			cfg, err := config.LoadOrCreate(root)
 			if err != nil {
@@ -599,7 +599,7 @@ func spawnDetached(cmd *cobra.Command, taskID string, maxConcurrent int) error {
 func storeFromFlags(cmd *cobra.Command) *store.Store {
 	root, _ := cmd.Flags().GetString("workspace")
 	if root == "" {
-		root = "/home/cyberkitty/.control-room"
+		root = config.DefaultWorkspace()
 	}
 	cfg, _ := config.LoadOrCreate(root)
 	s := store.New(root)
