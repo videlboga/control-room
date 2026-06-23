@@ -204,10 +204,8 @@ func (o *Orchestrator) RunEpic(epicID string, cb func(string, ...interface{})) e
 					cb("plan_doc_error", ready.ID, err)
 				}
 			}
-			if ready.Type == task.TypeEngineering {
-				if err := o.mergeEngineeringWorktree(ready); err != nil {
-					cb("merge_error", ready.ID, err)
-				}
+			if err := o.mergeApprovedWorktree(ready); err != nil {
+				cb("merge_error", ready.ID, err)
 			}
 
 			if nextType == "" || nextType == task.TypeQAVerify {
@@ -407,7 +405,7 @@ func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{}))
 					}
 				}
 				if ready.Type == task.TypeEngineering {
-					if err := o.mergeEngineeringWorktree(ready); err != nil {
+					if err := o.mergeApprovedWorktree(ready); err != nil {
 						cb("merge_error", ready.ID, err)
 					}
 				}
@@ -632,9 +630,9 @@ func (o *Orchestrator) copyResearchDoc(researchTask *task.Task) error {
 	return nil
 }
 
-// mergeEngineeringWorktree merges the approved engineering worktree branch back into
+// mergeApprovedWorktree merges the approved engineering worktree branch back into
 // the project's main repo so that subsequent engineering tasks inherit the state.
-func (o *Orchestrator) mergeEngineeringWorktree(t *task.Task) error {
+func (o *Orchestrator) mergeApprovedWorktree(t *task.Task) error {
 	proj, err := project.Get(o.Store, t.ProjectID)
 	if err != nil {
 		return err

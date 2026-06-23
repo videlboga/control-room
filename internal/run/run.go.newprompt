@@ -328,11 +328,7 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 	_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
 
 	prompt := buildPrompt(st, r, t, p, te, step, 0, nil)
-	maxTurns := 60
-	if t.Type == task.TypeEngineering {
-		maxTurns = 120
-	}
-	out, err := runHermes(user, profile, prompt, r.Worktree, filepath.Join(st.Root, "runs", r.ID, "activity.log"), maxTurns)
+	out, err := runHermes(user, profile, prompt, r.Worktree, filepath.Join(st.Root, "runs", r.ID, "activity.log"))
 	hermesFailed := err != nil
 	if hermesFailed {
 		r.Errors++
@@ -561,10 +557,7 @@ func (a *activityWriter) write(format string, args ...interface{}) {
 	fmt.Fprintf(f, "[%s] "+format+"\n", append([]interface{}{time.Now().UTC().Format(time.RFC3339)}, args...)...)
 }
 
-func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns int) (string, error) {
-	if maxTurns <= 0 {
-		maxTurns = 60
-	}
+func runHermes(user, profile, prompt, worktree, activityPath string) (string, error) {
 	act := &activityWriter{path: activityPath}
 	act.write("start profile=%s worktree=%s", profile, worktree)
 
@@ -573,9 +566,6 @@ func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns in
 		"chat", "-q", prompt,
 		"--toolsets", "file,terminal",
 		"--yolo",
-		"--quiet",
-		"--source", "tool",
-		"--max-turns", fmt.Sprintf("%d", maxTurns),
 	}
 	hermesBin := "/home/" + user + "/.local/bin/hermes"
 	if _, err := os.Stat(hermesBin); err != nil {
@@ -737,10 +727,6 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 			"The JSON must be under the key 'plan' with an array of engineering tasks. " +
 			"Each task: id, type='engineering', specialization, title, optional description, dependencies (array of ids). " +
 			"The JSON must be compact (single line), with no literal newlines inside string values — use \\n escapes if needed. " +
-			"CRITICAL: every engineering task must be TINY. A task is too big if it requires more than one of: a single endpoint, a single HTML template, a single handler function, or a single test file. " +
-			"Break every feature into the smallest possible sub-tasks. For example, separate 'create API endpoint', 'list API endpoint', 'HTML list template', 'HTML form template', and 'handler wiring' into distinct tasks. " +
-			"Prefer tasks that can be completed in under 15 tool-calling iterations. " +
-			"Use specializations: backend for JSON API handlers, template for HTML/template files, tests for test files, css for styles, cli for wiring/flags. " +
 			"After writing the file, report a concise summary of what you did.\n\n" +
 			"Example contents of docs/plan.json:\n" +
 			"{\"plan\":{\"tasks\":[{\"id\":\"eng-core\",\"type\":\"engineering\",\"specialization\":\"backend\",\"title\":\"Implement core\",\"dependencies\":[]}]}}\n")
