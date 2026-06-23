@@ -799,7 +799,9 @@ func cleanHermesOutput(s string) string {
 	lines := strings.Split(s, "\n")
 	var out []string
 	for _, line := range lines {
-		if strings.Contains(line, "preparing") || strings.Contains(line, "┊") {
+		// Strip Hermes progress-animation lines and the final session summary, but keep
+		// model reasoning/thinking lines and other content.
+		if strings.Contains(line, "preparing") {
 			continue
 		}
 		if strings.HasPrefix(line, "Resume this session") ||
