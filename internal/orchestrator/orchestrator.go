@@ -598,10 +598,21 @@ func (o *Orchestrator) copyPlanDoc(pmTask *task.Task) error {
 	if _, err := os.Stat(src); err != nil {
 		return fmt.Errorf("docs/plan.json not found in worktree: %w", err)
 	}
-	if err := project.AddDoc(o.Store, proj.ID, src); err != nil {
-		return fmt.Errorf("AddDoc failed for plan.json: %w", err)
+	if proj.DocsDir != "" {
+		docsDir := filepath.Join(proj.DocsDir, "docs")
+		if err := os.MkdirAll(docsDir, 0o755); err != nil {
+			return fmt.Errorf("mkdir docs dir failed: %w", err)
+		}
+		dst := filepath.Join(docsDir, "plan.json")
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return fmt.Errorf("read plan.json failed: %w", err)
+		}
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			return fmt.Errorf("write plan.json to docs dir failed: %w", err)
+		}
 	}
-	return nil
+	return project.AddDoc(o.Store, proj.ID, src)
 }
 
 // expandEngineering reads the PM plan output, validates it, and creates engineering tasks.

@@ -729,7 +729,7 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 		b.WriteString("\nAs the researcher, study the task and environment, then write a RESEARCH.md file in the working directory. " +
 			"It must contain these exact sections with concrete decisions (not placeholders):\n" +
 			"# RESEARCH.md\n\n## Stack\n- Programming language and framework(s)\n- Frontend approach (e.g. htmx CDN + Go html/template)\n- Build/test commands to use\n\n## Architecture\n- Directory layout\n- Key files/components\n\n## Acceptance Criteria\n- Specific behaviors the implementation must satisfy\n\n## Engineering Notes\n- Constraints the coder/engineer must follow\n\n" +
-			"Do not write code. Only write RESEARCH.md. The next QA reviewer will verify this document, and the PM/engineer will use it as the source of truth.\n")
+			"Do not write code. Only write RESEARCH.md. Before claiming the file is written, verify it exists with `ls RESEARCH.md`. The next QA reviewer will verify this document, and the PM/engineer will use it as the source of truth.\n")
 	}
 	if t.Type == task.TypePMPlan {
 		b.WriteString("\nAs the PM planner, produce a detailed implementation plan. " +
@@ -753,16 +753,16 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 		b.WriteString("You may read files and run git commands here. Prefer small, focused changes.\n")
 		switch t.Type {
 		case task.TypeQAReview:
-			b.WriteString("\nMANDATORY: before giving your verdict, read RESEARCH.md in this worktree. " +
+			b.WriteString("\nMANDATORY: verify paths and files exist before referring to them. Use `ls`, `find`, or `git status` to confirm actual locations. Before giving your verdict, read RESEARCH.md in this worktree. " +
 				"Verify that it contains concrete Stack, Architecture, Acceptance Criteria and Engineering Notes sections. " +
 				"If the research document is missing or unclear, reject the task in your summary. " +
 				"docs/plan.json is NOT required for this review step.\n")
 		case task.TypeQAVerify:
-			b.WriteString("\nMANDATORY: verify the implementation against RESEARCH.md acceptance criteria. " +
+			b.WriteString("\nMANDATORY: verify paths and files exist before referring to them. Verify the implementation against RESEARCH.md acceptance criteria. " +
 				"Run the project test command and lint command if available. " +
 				"If tests fail or acceptance criteria are not met, reject the task in your summary.\n")
 		default:
-			b.WriteString("\nMANDATORY: before writing code, read RESEARCH.md and docs/plan.json in this worktree. " +
+			b.WriteString("\nMANDATORY: verify paths and files exist before referring to them. Use `ls`, `find`, or `git status` to confirm actual locations. Do not assume RESEARCH.md or docs/plan.json are in a specific directory; check first. Read RESEARCH.md and docs/plan.json in this worktree. " +
 				"Follow the stack, architecture and acceptance criteria from RESEARCH.md exactly. " +
 				"If either file is missing or the stack is unclear, reject the task in your summary.\n")
 		}

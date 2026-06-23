@@ -44,7 +44,17 @@ func Run(st *store.Store, t *task.Task, r *run.Run, p *project.Project) (*Result
 // runResearchChecks ensures a non-trivial RESEARCH.md exists with required sections.
 func runResearchChecks(st *store.Store, t *task.Task, r *run.Run, p *project.Project) (*Result, error) {
 	res := &Result{Passed: true}
-	docPath := filepath.Join(p.DocsDir, "RESEARCH.md")
+	// Prefer the task worktree artifact; fall back to project docs for downstream checks.
+	docPath := ""
+	if r.Worktree != "" {
+		wtPath := filepath.Join(r.Worktree, "RESEARCH.md")
+		if _, err := os.Stat(wtPath); err == nil {
+			docPath = wtPath
+		}
+	}
+	if docPath == "" {
+		docPath = filepath.Join(p.DocsDir, "RESEARCH.md")
+	}
 	if _, err := os.Stat(docPath); err != nil {
 		res.Errors = append(res.Errors, fmt.Sprintf("RESEARCH.md missing in project docs (%s): %v", docPath, err))
 	} else {
@@ -130,7 +140,17 @@ type planFile struct {
 // runPMPlanChecks validates docs/plan.json structure.
 func runPMPlanChecks(st *store.Store, t *task.Task, r *run.Run, p *project.Project) (*Result, error) {
 	res := &Result{Passed: true}
-	planPath := filepath.Join(p.DocsDir, "docs", "plan.json")
+	// Prefer the task worktree artifact; fall back to project docs after copyPlanDoc.
+	planPath := ""
+	if r.Worktree != "" {
+		wtPath := filepath.Join(r.Worktree, "docs", "plan.json")
+		if _, err := os.Stat(wtPath); err == nil {
+			planPath = wtPath
+		}
+	}
+	if planPath == "" {
+		planPath = filepath.Join(p.DocsDir, "docs", "plan.json")
+	}
 	if _, err := os.Stat(planPath); err != nil {
 		res.Errors = append(res.Errors, fmt.Sprintf("docs/plan.json missing in project docs (%s): %v", planPath, err))
 		res.Passed = false
