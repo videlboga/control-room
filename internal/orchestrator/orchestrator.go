@@ -58,208 +58,18 @@ var transitions = map[task.TaskType]map[string]task.TaskType{
 
 // RunEpic expands an Epic into workflow tasks and drives them to completion.
 func (o *Orchestrator) RunEpic(epicID string, cb func(string, ...interface{})) error {
-	e, err := epic.Get(o.Store, epicID)
-	if err != nil {
-		return err
-	}
-	if e.Status == "done" {
-		return errors.New("epic already done")
-	}
-	e.Status = "in_progress"
-	_ = epic.Update(o.Store, e)
-
-	proj, err := project.Get(o.Store, e.ProjectID)
-	if err != nil {
-		return err
-	}
-	if proj.DefaultTeam == "" {
-		return errors.New("project has no default team for workflow tasks")
-	}
-
-	// Create initial research task if none exists.
-	children, err := task.ListByEpic(o.Store, epicID)
-	if err != nil {
-		return err
-	}
-	var researchTask *task.Task
-	for _, c := range children {
-		if c.Type == task.TypeResearch {
-			researchTask = &c
-			break
-		}
-	}
-	if researchTask == nil {
-		researchTask, err = task.Create(o.Store, &task.Task{
-			Title:       "Research: " + e.Title,
-			Description: e.Description,
-			Type:        task.TypeResearch,
-			ProjectID:   e.ProjectID,
-			EpicID:      e.ID,
-			TeamID:      proj.DefaultTeam,
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	for {
-		// 1. Pick a ready open task in this epic.
-		ready, err := o.nextReadyTask(epicID)
-		if err != nil {
-			return err
-		}
-		if ready == nil {
-			// Nothing open. Check if everything is done/approved.
-			if o.epicFinished(epicID) {
-				e.Status = "done"
-				_ = epic.Update(o.Store, e)
-				cb("epic_done", e.ID)
-				return nil
-			}
-			// Deadlock or all remaining tasks pending review.
-			cb("waiting_for_review", epicID)
-			return errors.New("no ready tasks: remaining tasks are pending review or blocked")
-		}
-
-		cb("task_start", ready.ID, ready.Type)
-
-		// 2. Run the task.
-		r, err := run.Start(o.Store, ready.ID)
-		if err != nil {
-			return fmt.Errorf("failed to start run for task %s: %w", ready.ID, err)
-		}
-
-		// Wait for the run to finish. We tail events synchronously.
-		var lastEvents []run.Event
-		waitErr := run.WaitFor(o.Store, r.ID, func(ev run.Event) {
-			lastEvents = append(lastEvents, ev)
-			cb("event", ev)
-		})
-		if waitErr != nil {
-			cb("wait_error", waitErr)
-		}
-
-		// 3. Read verdict from run metadata.
-		verdict, reason, verdictErr := o.readVerdict(r.ID)
-		if verdictErr != nil {
-			cb("verdict_error", ready.ID, verdictErr)
-			// Treat missing/invalid verdict as reject.
-			verdict = "reject"
-			reason = "no valid verdict in run metadata: " + verdictErr.Error()
-		}
-
-		// 3.5 Human-in-the-loop override for QA verify.
-		if o.ManualApprove && ready.Type == task.TypeQAVerify && verdict == "approve" {
-			if o.Prompt != nil {
-				cb("awaiting_manual_approval", ready.ID)
-				verdict, reason = o.Prompt(ready.ID)
-				cb("manual_verdict", ready.ID, verdict, reason)
-			}
-		}
-
-		ready.Status = task.StatusPendingReview
-		ready.Verdict = verdict
-		ready.VerdictReason = reason
-		_ = task.Update(o.Store, ready)
-
-		cb("task_verdict", ready.ID, verdict, reason)
-
-		// 4. Hard gate checks override an LLM approve.
-		if verdict == "approve" {
-			proj, _ := project.Get(o.Store, e.ProjectID)
-			g, err := gate.Run(o.Store, ready, r, proj)
-			if err != nil {
-				cb("gate_error", ready.ID, err)
-				verdict = "reject"
-				reason = "gate check error: " + err.Error()
-			} else if !g.Passed {
-				cb("gate_failed", ready.ID, g.Errors)
-				verdict = "reject"
-				reason = "gate checks failed: " + strings.Join(g.Errors, "; ")
-			}
-		}
-
-		// 5. Apply deterministic transition.
-		// 5. Apply deterministic transition.
-		if verdict == "approve" {
-			ready.Status = task.StatusApproved
-			ready.EndedAt = time.Now().UTC().Format(time.RFC3339)
-			_ = task.Update(o.Store, ready)
-
-			if ready.Type == task.TypePMConsistency {
-				e.Status = "done"
-				_ = epic.Update(o.Store, e)
-				cb("epic_done", e.ID)
-				return nil
-			}
-
-			nextType := transitions[ready.Type]["approved"]
-			if ready.Type == task.TypeResearch {
-				if err := o.copyResearchDoc(ready); err != nil {
-					cb("research_doc_error", ready.ID, err)
-				}
-			}
-			if ready.Type == task.TypePMPlan {
-				if err := o.copyPlanDoc(ready); err != nil {
-					cb("plan_doc_error", ready.ID, err)
-				}
-			}
-			if err := o.mergeApprovedWorktree(ready); err != nil {
-				cb("merge_error", ready.ID, err)
-			}
-
-			if nextType == "" || nextType == task.TypeQAVerify {
-				// Engineering approved: the orchestrator already created a single QA verify
-				// task that depends on all engineering tasks. No new task is created here.
-				cb("task_done", ready.ID)
-				continue
-			}
-			if nextType == task.TypeEngineering {
-				// PM plan expands to engineering tasks.
-				if err := o.expandEngineering(ready); err != nil {
-					return err
-				}
-			} else {
-				if _, err := task.Create(o.Store, &task.Task{
-					Title:       o.nextTitle(nextType, ready),
-					Type:        nextType,
-					ProjectID:   e.ProjectID,
-					EpicID:      e.ID,
-					ParentID:    ready.ID,
-					TeamID:      proj.DefaultTeam,
-					Description: ready.Description,
-				}); err != nil {
-					return err
-				}
-			}
-		} else {
-			// reject
-			ready.Status = task.StatusRejected
-			_ = task.Update(o.Store, ready)
-
-			redoType := transitions[ready.Type]["rejected"]
-			if redoType == "" {
-				redoType = ready.Type
-			}
-			redo, err := task.Redo(o.Store, ready, reason)
-			if err != nil {
-				return err
-			}
-			redo.Type = redoType
-			_ = task.Update(o.Store, redo)
-			if redoType == task.TypeEngineering {
-				if err := o.updateDependenciesAfterRedo(ready, redo); err != nil {
-					cb("redo_dep_update_error", redo.ID, err)
-				}
-			}
-			cb("redo_created", redo.ID, redoType, reason)
-		}
-	}
+	return o.runEpicLoop(epicID, false, cb)
 }
 
 // WatchEpic runs a detached-style orchestration loop. It starts every ready task
 // in parallel, waits for all of them, then applies transitions and repeats.
 func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{})) error {
+	return o.runEpicLoop(epicID, true, cb)
+}
+
+// runEpicLoop is the shared orchestration engine for both RunEpic (sequential)
+// and WatchEpic (parallel batch) modes.
+func (o *Orchestrator) runEpicLoop(epicID string, parallel bool, cb func(string, ...interface{})) error {
 	e, err := epic.Get(o.Store, epicID)
 	if err != nil {
 		return err
@@ -278,40 +88,21 @@ func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{}))
 		return errors.New("project has no default team for workflow tasks")
 	}
 
-	children, err := task.ListByEpic(o.Store, epicID)
-	if err != nil {
+	if _, err := o.ensureResearchTask(e, proj); err != nil {
 		return err
-	}
-	var researchTask *task.Task
-	for _, c := range children {
-		if c.Type == task.TypeResearch {
-			researchTask = &c
-			break
-		}
-	}
-	if researchTask == nil {
-		researchTask, err = task.Create(o.Store, &task.Task{
-			Title:       "Research: " + e.Title,
-			Description: e.Description,
-			Type:        task.TypeResearch,
-			ProjectID:   e.ProjectID,
-			EpicID:      e.ID,
-			TeamID:      proj.DefaultTeam,
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	type taskResult struct {
-		t       *task.Task
-		r       *run.Run
-		verdict string
-		reason  string
 	}
 
 	for {
-		ready, err := o.nextReadyTasks(epicID)
+		var ready []task.Task
+		if parallel {
+			ready, err = o.nextReadyTasks(epicID)
+		} else {
+			var single *task.Task
+			single, err = o.nextReadyTask(epicID)
+			if single != nil {
+				ready = []task.Task{*single}
+			}
+		}
 		if err != nil {
 			return err
 		}
@@ -326,148 +117,218 @@ func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{}))
 			return errors.New("no ready tasks: remaining tasks are pending review or blocked")
 		}
 
-		cb("batch_ready", len(ready))
+		if parallel {
+			cb("batch_ready", len(ready))
+		}
 		for _, t := range ready {
 			cb("task_start", t.ID, t.Type)
 		}
 
-		var wg sync.WaitGroup
-		mu := sync.Mutex{}
-		results := make(map[string]*taskResult, len(ready))
-		for i := range ready {
-			t := &ready[i]
+		if parallel {
+			var wg sync.WaitGroup
+			mu := sync.Mutex{}
+			results := make([]struct {
+				t       *task.Task
+				r       *run.Run
+				verdict string
+				reason  string
+				err     error
+			}, len(ready))
+			for i := range ready {
+				t := &ready[i]
+				r, err := run.Start(o.Store, t.ID)
+				if err != nil {
+					return fmt.Errorf("failed to start run for task %s: %w", t.ID, err)
+				}
+				wg.Add(1)
+				go func(idx int, t *task.Task, r *run.Run) {
+					defer wg.Done()
+					verdict, reason, err := o.runTaskToVerdict(t, r, cb)
+					mu.Lock()
+					results[idx] = struct {
+						t       *task.Task
+						r       *run.Run
+						verdict string
+						reason  string
+						err     error
+					}{t, r, verdict, reason, err}
+					mu.Unlock()
+				}(i, t, r)
+			}
+			wg.Wait()
+			for _, res := range results {
+				if res.err != nil {
+					return res.err
+				}
+				if err := o.applyTaskResolution(res.t, res.verdict, res.reason, e, proj, cb); err != nil {
+					return err
+				}
+			}
+		} else {
+			t := &ready[0]
 			r, err := run.Start(o.Store, t.ID)
 			if err != nil {
 				return fmt.Errorf("failed to start run for task %s: %w", t.ID, err)
 			}
-			wg.Add(1)
-			go func(t *task.Task, r *run.Run) {
-				defer wg.Done()
-				_ = run.WaitFor(o.Store, r.ID, func(ev run.Event) {
-					cb("event", ev)
-				})
-				verdict, reason, verdictErr := o.readVerdict(r.ID)
-				if verdictErr != nil {
-					cb("verdict_error", t.ID, verdictErr)
-					verdict = "reject"
-					reason = "no valid verdict in run metadata: " + verdictErr.Error()
-				}
-				if o.ManualApprove && t.Type == task.TypeQAVerify && verdict == "approve" {
-					if o.Prompt != nil {
-						cb("awaiting_manual_approval", t.ID)
-						verdict, reason = o.Prompt(t.ID)
-						cb("manual_verdict", t.ID, verdict, reason)
-					}
-				}
-				if verdict == "approve" {
-					proj, _ := project.Get(o.Store, e.ProjectID)
-					g, err := gate.Run(o.Store, t, r, proj)
-					if err != nil {
-						cb("gate_error", t.ID, err)
-						verdict = "reject"
-						reason = "gate check error: " + err.Error()
-					} else if !g.Passed {
-						cb("gate_failed", t.ID, g.Errors)
-						verdict = "reject"
-						reason = "gate checks failed: " + strings.Join(g.Errors, "; ")
-					}
-				}
-				mu.Lock()
-				results[t.ID] = &taskResult{t: t, r: r, verdict: verdict, reason: reason}
-				mu.Unlock()
-			}(t, r)
-		}
-		wg.Wait()
-
-		for _, res := range results {
-			ready := res.t
-			verdict := res.verdict
-			reason := res.reason
-
-			cb("task_verdict", ready.ID, verdict, reason)
-
-			if verdict == "approve" {
-				ready.Status = task.StatusApproved
-				ready.EndedAt = time.Now().UTC().Format(time.RFC3339)
-				_ = task.Update(o.Store, ready)
-
-				if ready.Type == task.TypePMConsistency {
-					e.Status = "done"
-					_ = epic.Update(o.Store, e)
-					cb("epic_done", e.ID)
-					return nil
-				}
-
-				nextType := transitions[ready.Type]["approved"]
-				if ready.Type == task.TypeResearch {
-					if err := o.copyResearchDoc(ready); err != nil {
-						cb("research_doc_error", ready.ID, err)
-					}
-				}
-				if ready.Type == task.TypePMPlan {
-					if err := o.copyPlanDoc(ready); err != nil {
-						cb("plan_doc_error", ready.ID, err)
-					}
-				}
-				if err := o.mergeApprovedWorktree(ready); err != nil {
-					cb("merge_error", ready.ID, err)
-				}
-				if nextType == "" || nextType == task.TypeQAVerify {
-					cb("task_done", ready.ID)
-					continue
-				}
-				if nextType == task.TypeEngineering {
-					if err := o.expandEngineering(ready); err != nil {
-						return err
-					}
-				} else {
-					if _, err := task.Create(o.Store, &task.Task{
-						Title:       o.nextTitle(nextType, ready),
-						Type:        nextType,
-						ProjectID:   e.ProjectID,
-						EpicID:      e.ID,
-						ParentID:    ready.ID,
-						TeamID:      proj.DefaultTeam,
-						Description: ready.Description,
-					}); err != nil {
-						return err
-					}
-				}
-			} else {
-				ready.Status = task.StatusRejected
-				_ = task.Update(o.Store, ready)
-
-				maxRedo := o.MaxRedo
-				if maxRedo <= 0 {
-					maxRedo = 3
-				}
-				if ready.RedoIndex >= maxRedo {
-					cb("task_failed", ready.ID, "max redo attempts reached")
-					continue
-				}
-
-				redoType := transitions[ready.Type]["rejected"]
-				if redoType == "" {
-					redoType = ready.Type
-				}
-				redo, err := task.Redo(o.Store, ready, reason)
-				if err != nil {
-					return err
-				}
-				redo.Type = redoType
-				_ = task.Update(o.Store, redo)
-				if redoType == task.TypeEngineering {
-					if err := o.updateDependenciesAfterRedo(ready, redo); err != nil {
-						cb("redo_dep_update_error", redo.ID, err)
-					}
-				}
-				cb("redo_created", redo.ID, redoType, reason)
+			verdict, reason, err := o.runTaskToVerdict(t, r, cb)
+			if err != nil {
+				return err
+			}
+			if err := o.applyTaskResolution(t, verdict, reason, e, proj, cb); err != nil {
+				return err
 			}
 		}
 	}
 }
 
-// nextReadyTasks returns all tasks that can start in parallel: one per group,
+func (o *Orchestrator) ensureResearchTask(e *epic.Epic, proj *project.Project) (*task.Task, error) {
+	children, err := task.ListByEpic(o.Store, e.ID)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range children {
+		if c.Type == task.TypeResearch {
+			return &c, nil
+		}
+	}
+	return task.Create(o.Store, &task.Task{
+		Title:       "Research: " + e.Title,
+		Description: e.Description,
+		Type:        task.TypeResearch,
+		ProjectID:   e.ProjectID,
+		EpicID:      e.ID,
+		TeamID:      proj.DefaultTeam,
+	})
+}
+
+func (o *Orchestrator) runTaskToVerdict(t *task.Task, r *run.Run, cb func(string, ...interface{})) (string, string, error) {
+	waitErr := run.WaitFor(o.Store, r.ID, func(ev run.Event) {
+		cb("event", ev)
+	})
+	if waitErr != nil {
+		cb("wait_error", waitErr)
+	}
+
+	verdict, reason, verdictErr := o.readVerdict(r.ID)
+	if verdictErr != nil {
+		cb("verdict_error", t.ID, verdictErr)
+		verdict = "reject"
+		reason = "no valid verdict in run metadata: " + verdictErr.Error()
+	}
+
+	if o.ManualApprove && t.Type == task.TypeQAVerify && verdict == "approve" {
+		if o.Prompt != nil {
+			cb("awaiting_manual_approval", t.ID)
+			verdict, reason = o.Prompt(t.ID)
+			cb("manual_verdict", t.ID, verdict, reason)
+		}
+	}
+
+	t.Status = task.StatusPendingReview
+	t.Verdict = verdict
+	t.VerdictReason = reason
+	_ = task.Update(o.Store, t)
+	cb("task_verdict", t.ID, verdict, reason)
+
+	if verdict == "approve" {
+		proj, _ := project.Get(o.Store, t.ProjectID)
+		g, err := gate.Run(o.Store, t, r, proj)
+		if err != nil {
+			cb("gate_error", t.ID, err)
+			verdict = "reject"
+			reason = "gate check error: " + err.Error()
+		} else if !g.Passed {
+			cb("gate_failed", t.ID, g.Errors)
+			verdict = "reject"
+			reason = "gate checks failed: " + strings.Join(g.Errors, "; ")
+		}
+		if verdict != "approve" {
+			t.Status = task.StatusPendingReview
+			t.Verdict = verdict
+			t.VerdictReason = reason
+			_ = task.Update(o.Store, t)
+			cb("task_verdict", t.ID, verdict, reason)
+		}
+	}
+
+	return verdict, reason, nil
+}
+
+func (o *Orchestrator) applyTaskResolution(t *task.Task, verdict, reason string, e *epic.Epic, proj *project.Project, cb func(string, ...interface{})) error {
+	if verdict == "approve" {
+		t.Status = task.StatusApproved
+		t.EndedAt = time.Now().UTC().Format(time.RFC3339)
+		_ = task.Update(o.Store, t)
+
+		if t.Type == task.TypePMConsistency {
+			e.Status = "done"
+			_ = epic.Update(o.Store, e)
+			cb("epic_done", e.ID)
+			return nil
+		}
+
+		nextType := transitions[t.Type]["approved"]
+		if t.Type == task.TypeResearch {
+			if err := o.copyResearchDoc(t); err != nil {
+				cb("research_doc_error", t.ID, err)
+			}
+		}
+		if t.Type == task.TypePMPlan {
+			if err := o.copyPlanDoc(t); err != nil {
+				cb("plan_doc_error", t.ID, err)
+			}
+		}
+		if err := o.mergeApprovedWorktree(t); err != nil {
+			cb("merge_error", t.ID, err)
+		}
+
+		if nextType == "" || nextType == task.TypeQAVerify {
+			cb("task_done", t.ID)
+			return nil
+		}
+		if nextType == task.TypeEngineering {
+			if err := o.expandEngineering(t); err != nil {
+				return err
+			}
+			return nil
+		}
+		if _, err := task.Create(o.Store, &task.Task{
+			Title:       o.nextTitle(nextType, t),
+			Type:        nextType,
+			ProjectID:   e.ProjectID,
+			EpicID:      e.ID,
+			ParentID:    t.ID,
+			TeamID:      proj.DefaultTeam,
+			Description: t.Description,
+		}); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	t.Status = task.StatusRejected
+	_ = task.Update(o.Store, t)
+
+	redoType := transitions[t.Type]["rejected"]
+	if redoType == "" {
+		redoType = t.Type
+	}
+	redo, err := task.Redo(o.Store, t, reason)
+	if err != nil {
+		return err
+	}
+	redo.Type = redoType
+	_ = task.Update(o.Store, redo)
+	if redoType == task.TypeEngineering {
+		if err := o.updateDependenciesAfterRedo(t, redo); err != nil {
+			cb("redo_dep_update_error", redo.ID, err)
+		}
+	}
+	cb("redo_created", redo.ID, redoType, reason)
+	return nil
+}
+
+// Expand first-run helpers.
 // with dependencies satisfied.
 func (o *Orchestrator) nextReadyTasks(epicID string) ([]task.Task, error) {
 	tasks, err := task.ListByEpic(o.Store, epicID)
