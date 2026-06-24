@@ -66,6 +66,7 @@ func (o *Orchestrator) RunEpic(epicID string, cb func(string, ...interface{})) e
 // WatchEpic runs a detached-style orchestration loop. It starts every ready task
 // in parallel, waits for all of them, then applies transitions and repeats.
 func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{})) error {
+	defer o.cleanupWatchLock(epicID)
 	return o.runEpicLoop(epicID, true, cb)
 }
 
@@ -118,6 +119,12 @@ func (o *Orchestrator) runEpicLoop(epicID string, parallel bool, cb func(string,
 				return nil
 			}
 			cb("waiting_for_review", epicID)
+			if parallel {
+				// Watch mode: absence of ready tasks is normal when the epic is blocked
+				// waiting for review or external input. Return cleanly so the cronjob
+				// does not spam error alerts.
+				return nil
+			}
 			return errors.New("no ready tasks: remaining tasks are pending review or blocked")
 		}
 
@@ -183,6 +190,11 @@ func (o *Orchestrator) runEpicLoop(epicID string, parallel bool, cb func(string,
 			}
 		}
 	}
+}
+
+func (o *Orchestrator) cleanupWatchLock(epicID string) {
+	lockPath := filepath.Join(o.Store.Root, ".watch-lock", epicID+".lock")
+	_ = os.Remove(lockPath)
 }
 
 func (o *Orchestrator) ensureResearchTask(e *epic.Epic, proj *project.Project) (*task.Task, error) {

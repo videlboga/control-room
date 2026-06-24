@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -73,7 +74,11 @@ func isLocked(path string) bool {
 	if err != nil {
 		return false
 	}
-	pid, _ := strconv.Atoi(string(data))
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return false
+	}
+	pid, _ := strconv.Atoi(fields[0])
 	if pid <= 0 {
 		return false
 	}
