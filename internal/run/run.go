@@ -24,22 +24,23 @@ import (
 
 // Run is a concrete task execution.
 type Run struct {
-	ID        string            `json:"id" yaml:"id"`
-	DisplayID string            `json:"display_id,omitempty" yaml:"display_id,omitempty"`
-	TaskID    string            `json:"task_id" yaml:"task_id"`
-	ProjectID string            `json:"project_id" yaml:"project_id"`
-	TeamID    string            `json:"team_id" yaml:"team_id"`
-	Status    string            `json:"status" yaml:"status"`
-	Branch    string            `json:"branch" yaml:"branch"`
-	Worktree  string            `json:"worktree" yaml:"worktree"`
-	Agent     string            `json:"agent" yaml:"agent"`
-	Step      string            `json:"step" yaml:"step"`
-	Errors    int               `json:"errors" yaml:"errors"`
-	Summary   string            `json:"summary,omitempty" yaml:"summary,omitempty"`
-	StartedAt string            `json:"started_at" yaml:"started_at"`
-	EndedAt   string            `json:"ended_at,omitempty" yaml:"ended_at,omitempty"`
-	PID       int               `json:"pid,omitempty" yaml:"pid,omitempty"`
-	Metadata  map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	ID            string            `json:"id" yaml:"id"`
+	DisplayID     string            `json:"display_id,omitempty" yaml:"display_id,omitempty"`
+	TaskID        string            `json:"task_id" yaml:"task_id"`
+	ProjectID     string            `json:"project_id" yaml:"project_id"`
+	TeamID        string            `json:"team_id" yaml:"team_id"`
+	Status        string            `json:"status" yaml:"status"`
+	Branch        string            `json:"branch" yaml:"branch"`
+	Worktree      string            `json:"worktree" yaml:"worktree"`
+	Agent         string            `json:"agent" yaml:"agent"`
+	Step          string            `json:"step" yaml:"step"`
+	Errors        int               `json:"errors" yaml:"errors"`
+	Summary       string            `json:"summary,omitempty" yaml:"summary,omitempty"`
+	StartedAt     string            `json:"started_at" yaml:"started_at"`
+	EndedAt       string            `json:"ended_at,omitempty" yaml:"ended_at,omitempty"`
+	PID           int               `json:"pid,omitempty" yaml:"pid,omitempty"`
+	Metadata      map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	RuntimeConfig config.RuntimeConfig `json:"runtime_config,omitempty" yaml:"runtime_config,omitempty"`
 }
 
 // Event is a single log entry.
@@ -92,6 +93,7 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 			"task_title": t.Title,
 			"team_name":  te.Name,
 		},
+		RuntimeConfig: t.RuntimeConfig,
 	}
 	cfg, _ := config.LoadOrCreate(st.Root)
 	if cfg != nil {
@@ -382,12 +384,21 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 	_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
 
 	prompt := buildPrompt(st, r, t, p, te, step, 0, nil)
-	maxTurns := 60
-	if t.Type == task.TypeEngineering {
-		maxTurns = 120
+	maxTurns := r.RuntimeConfig.MaxTurns
+	if maxTurns <= 0 {
+		maxTurns = 60
+		if t.Type == task.TypeEngineering {
+			maxTurns = 120
+		}
 	}
+	cfg, _ := config.LoadOrCreate(st.Root)
+	defaults := config.RuntimeConfig{}
+	if cfg != nil {
+		defaults = cfg.RuntimeConfig
+	}
+	rtc := r.RuntimeConfig.Merge(defaults)
 	activityPath := filepath.Join(st.Root, "runs", r.ID, "activity.log")
-	out, err := runHermes(user, profile, prompt, r.Worktree, activityPath, maxTurns, func(pid int) {
+	out, err := runHermes(user, profile, rtc.Provider, rtc.Model, prompt, r.Worktree, activityPath, maxTurns, func(pid int) {
 		r.PID = pid
 		_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
 	})
@@ -692,12 +703,12 @@ func (a *activityWriter) write(format string, args ...interface{}) {
 	fmt.Fprintf(f, "[%s] "+format+"\n", append([]interface{}{time.Now().UTC().Format(time.RFC3339)}, args...)...)
 }
 
-func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns int, setPID func(int)) (string, error) {
+func runHermes(user, profile, provider, model, prompt, worktree, activityPath string, maxTurns int, setPID func(int)) (string, error) {
 	if maxTurns <= 0 {
 		maxTurns = 60
 	}
 	act := &activityWriter{path: activityPath}
-	act.write("start profile=%s worktree=%s", profile, worktree)
+	act.write("start profile=%s provider=%s model=%s worktree=%s", profile, provider, model, worktree)
 
 	args := []string{
 		"--profile", profile,
@@ -706,6 +717,12 @@ func runHermes(user, profile, prompt, worktree, activityPath string, maxTurns in
 		"--yolo",
 		"--source", "tool",
 		"--max-turns", fmt.Sprintf("%d", maxTurns),
+	}
+	if provider != "" {
+		args = append(args, "--provider", provider)
+	}
+	if model != "" {
+		args = append(args, "--model", model)
 	}
 	hermesBin := "/home/" + user + "/.local/bin/hermes"
 	if _, err := os.Stat(hermesBin); err != nil {

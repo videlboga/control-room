@@ -16,17 +16,18 @@ import (
 
 // WorkspaceConfig holds top-level workspace settings.
 type WorkspaceConfig struct {
-	Root                string       `yaml:"root"`
-	HermesUser          string       `yaml:"hermes_user"`
-	HermesSourceProfile string       `yaml:"hermes_source_profile"`
-	MaxConcurrentRuns   int          `yaml:"max_concurrent_runs"`
-	StubMode            bool         `yaml:"stub_mode"`
-	Backend             string       `yaml:"backend,omitempty"`
-	PostgresDSN         string       `yaml:"postgres_dsn,omitempty"`
-	EpicSeq             int          `yaml:"epic_seq,omitempty"`
-	TaskSeq             int          `yaml:"task_seq,omitempty"`
-	RunSeq              int          `yaml:"run_seq,omitempty"`
-	Policy              TaskPolicy   `yaml:"policy,omitempty"`
+	Root                string          `yaml:"root"`
+	HermesUser          string          `yaml:"hermes_user"`
+	HermesSourceProfile string          `yaml:"hermes_source_profile"`
+	MaxConcurrentRuns   int             `yaml:"max_concurrent_runs"`
+	StubMode            bool            `yaml:"stub_mode"`
+	Backend             string          `yaml:"backend,omitempty"`
+	PostgresDSN         string          `yaml:"postgres_dsn,omitempty"`
+	RuntimeConfig       RuntimeConfig   `yaml:"runtime_config,omitempty"`
+	EpicSeq             int             `yaml:"epic_seq,omitempty"`
+	TaskSeq             int             `yaml:"task_seq,omitempty"`
+	RunSeq              int             `yaml:"run_seq,omitempty"`
+	Policy              TaskPolicy      `yaml:"policy,omitempty"`
 }
 
 // TaskPolicy configures completion behaviour for gate tasks.
@@ -44,6 +45,33 @@ type TaskPolicy struct {
 	// MaxRedoAttempts is the per-task redo limit. When exceeded the task is
 	// escalated to the recovery team/agent instead of creating another redo.
 	MaxRedoAttempts int `yaml:"max_redo_attempts,omitempty"`
+}
+
+// RuntimeConfig overrides the Hermes provider/model/turns/timeout for a task or
+// for the whole workspace default. Empty values fall back to the Hermes profile.
+type RuntimeConfig struct {
+	Provider string `json:"provider,omitempty" yaml:"provider,omitempty"`
+	Model    string `json:"model,omitempty" yaml:"model,omitempty"`
+	MaxTurns int    `json:"max_turns,omitempty" yaml:"max_turns,omitempty"`
+	Timeout  string `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+}
+
+// Merge fills empty fields from defaults.
+func (r *RuntimeConfig) Merge(defaults RuntimeConfig) RuntimeConfig {
+	out := *r
+	if out.Provider == "" {
+		out.Provider = defaults.Provider
+	}
+	if out.Model == "" {
+		out.Model = defaults.Model
+	}
+	if out.MaxTurns <= 0 {
+		out.MaxTurns = defaults.MaxTurns
+	}
+	if out.Timeout == "" {
+		out.Timeout = defaults.Timeout
+	}
+	return out
 }
 
 // RequiresDisposition reports whether a task type must produce an explicit verdict.

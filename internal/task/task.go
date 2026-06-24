@@ -69,6 +69,7 @@ type Task struct {
 	// Escalation tracks when this task was moved to senior/recovery after max redo.
 	EscalatedTo       string     `json:"escalated_to,omitempty" yaml:"escalated_to,omitempty"`
 	EscalatedAt       string     `json:"escalated_at,omitempty" yaml:"escalated_at,omitempty"`
+	RuntimeConfig     config.RuntimeConfig `json:"runtime_config,omitempty" yaml:"runtime_config,omitempty"`
 }
 
 // HasValidVerdict returns true when the task produced approve or reject.

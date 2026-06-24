@@ -256,12 +256,22 @@ func taskCmd() *cobra.Command {
 			teamID, _ := cmd.Flags().GetString("team")
 			desc, _ := cmd.Flags().GetString("description")
 			typ, _ := cmd.Flags().GetString("type")
+			provider, _ := cmd.Flags().GetString("provider")
+			model, _ := cmd.Flags().GetString("model")
+			maxTurns, _ := cmd.Flags().GetInt("max-turns")
+			timeout, _ := cmd.Flags().GetString("timeout")
 			t := &task.Task{
 				Title:       title,
 				ProjectID:   projectID,
 				TeamID:      teamID,
 				Type:        task.TaskType(typ),
 				Description: desc,
+				RuntimeConfig: config.RuntimeConfig{
+					Provider: provider,
+					Model:    model,
+					MaxTurns: maxTurns,
+					Timeout:  timeout,
+				},
 			}
 			created, err := task.Create(st, t)
 			if err != nil {
@@ -276,6 +286,10 @@ func taskCmd() *cobra.Command {
 	create.Flags().String("team", "", "team id")
 	create.Flags().String("description", "", "task description")
 	create.Flags().String("type", "engineering", "task type: research, qa_review, pm_plan, engineering, qa_verify, pm_consistency")
+	create.Flags().String("provider", "", "Hermes provider override (e.g. ollama-cloud)")
+	create.Flags().String("model", "", "Hermes model override (e.g. kimi-k2.7-code)")
+	create.Flags().Int("max-turns", 0, "max turns override")
+	create.Flags().String("timeout", "", "timeout override (e.g. 30m)")
 	for _, f := range []string{"title", "project", "team", "type"} {
 		_ = create.MarkFlagRequired(f)
 	}
@@ -827,6 +841,69 @@ func workspaceCmd() *cobra.Command {
 	set.Flags().Int("max-redo", 0, "max redo attempts before senior escalation")
 
 	cmd.AddCommand(policy, set)
+
+	runtime := &cobra.Command{
+		Use:   "runtime",
+		Short: "Show current workspace runtime config",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, _ := cmd.Flags().GetString("workspace")
+			if root == "" {
+				root = config.DefaultWorkspace()
+			}
+			cfg, err := config.LoadOrCreate(root)
+			if err != nil {
+				return err
+			}
+			data, err := yaml.Marshal(cfg.RuntimeConfig)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("workspace: %s\n%s\n", root, string(data))
+			return nil
+		},
+	}
+
+	setRuntime := &cobra.Command{
+		Use:   "set-runtime",
+		Short: "Set workspace runtime defaults",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, _ := cmd.Flags().GetString("workspace")
+			if root == "" {
+				root = config.DefaultWorkspace()
+			}
+			cfg, err := config.LoadOrCreate(root)
+			if err != nil {
+				return err
+			}
+			if v, err := cmd.Flags().GetString("provider"); err == nil && v != "" {
+				cfg.RuntimeConfig.Provider = v
+			}
+			if v, err := cmd.Flags().GetString("model"); err == nil && v != "" {
+				cfg.RuntimeConfig.Model = v
+			}
+			if v, err := cmd.Flags().GetInt("max-turns"); err == nil && v > 0 {
+				cfg.RuntimeConfig.MaxTurns = v
+			}
+			if v, err := cmd.Flags().GetString("timeout"); err == nil && v != "" {
+				cfg.RuntimeConfig.Timeout = v
+			}
+			data, err := yaml.Marshal(cfg)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(root, "workspace.yaml"), data, 0o644); err != nil {
+				return err
+			}
+			fmt.Println("workspace runtime config updated")
+			return nil
+		},
+	}
+	setRuntime.Flags().String("provider", "", "default Hermes provider")
+	setRuntime.Flags().String("model", "", "default Hermes model")
+	setRuntime.Flags().Int("max-turns", 0, "default max turns")
+	setRuntime.Flags().String("timeout", "", "default timeout")
+
+	cmd.AddCommand(runtime, setRuntime)
 	return cmd
 }
 
