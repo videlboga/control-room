@@ -98,6 +98,19 @@ func (o *Orchestrator) runEpicLoop(epicID string, parallel bool, cb func(string,
 	}
 
 	for {
+		// First, resolve any pending_review tasks that already have a valid verdict.
+		// This prevents tasks from getting stuck between "agent finished" and
+		// "resolution applied" when the orchestration loop restarts.
+		pending, err := o.nextPendingReviewTasks(epicID)
+		if err != nil {
+			return err
+		}
+		for _, t := range pending {
+			if err := o.applyTaskResolution(&t, t.Verdict, t.VerdictReason, e, proj, cb); err != nil {
+				return err
+			}
+		}
+
 		var ready []task.Task
 		if parallel {
 			ready, err = o.nextReadyTasks(epicID)
@@ -111,7 +124,7 @@ func (o *Orchestrator) runEpicLoop(epicID string, parallel bool, cb func(string,
 		if err != nil {
 			return err
 		}
-		if len(ready) == 0 {
+		if len(ready) == 0 && len(pending) == 0 {
 			if o.epicFinished(epicID) {
 				e.Status = "done"
 				_ = epic.Update(o.Store, e)
@@ -297,6 +310,15 @@ func (o *Orchestrator) applyPolicy(t *task.Task, verdict, reason string) (string
 	// Require explicit disposition: anything other than approve/reject is rejected.
 	if !t.HasValidVerdict() && pol.RequiresDisposition(string(t.Type)) {
 		return "reject", "policy requires explicit disposition: " + t.DispositionReason()
+	}
+
+	// If the agent produced a clear approve, mark the task as approved now so
+	// it does not get stuck in pending_review waiting for a resolution pass
+	// that may never come (e.g. watch mode where only open tasks are selected).
+	if verdict == "approve" {
+		t.Status = task.StatusApproved
+		t.EndedAt = time.Now().UTC().Format(time.RFC3339)
+		return verdict, reason
 	}
 
 	// Auto-approve tasks stuck in pending_review beyond the configured duration.
@@ -504,6 +526,26 @@ func (o *Orchestrator) nextReadyTasks(epicID string) ([]task.Task, error) {
 	})
 
 	return ready, nil
+}
+
+// nextPendingReviewTasks returns tasks that already have a valid verdict but
+// are still in pending_review, so the loop can apply their resolution.
+func (o *Orchestrator) nextPendingReviewTasks(epicID string) ([]task.Task, error) {
+	tasks, err := task.ListByEpic(o.Store, epicID)
+	if err != nil {
+		return nil, err
+	}
+	var pending []task.Task
+	for _, t := range tasks {
+		if t.Status != task.StatusPendingReview {
+			continue
+		}
+		if t.Verdict != "approve" && t.Verdict != "reject" {
+			continue
+		}
+		pending = append(pending, t)
+	}
+	return pending, nil
 }
 
 // nextReadyTask returns the next task that can start.
