@@ -1,9 +1,9 @@
 {{template "layout" .}}
-{{define "title"}}Задача {{.Task.ID}}{{end}}
+{{define "title"}}Задача {{.Task.DisplayID}}{{end}}
 {{define "content"}}
-<h1>{{.Task.Title}}</h1>
+<h1>{{.Task.Title}} <span class="muted">{{.Task.DisplayID}}</span></h1>
 <div class="card">
-	<p><strong>ID:</strong> {{.Task.ID}}</p>
+	<p><strong>Internal ID:</strong> {{.Task.ID}}</p>
 	<p><strong>Тип:</strong> {{.Task.Type}}</p>
 	<p><strong>Проект:</strong> {{.Task.ProjectID}}</p>
 	<p><strong>Эпик:</strong> {{.Task.EpicID}}</p>
@@ -13,10 +13,11 @@
 <div class="card">
 	<h2>Запуски</h2>
 	<table>
-		<tr><th>ID</th><th>Агент</th><th>Шаг</th><th>Статус</th><th>Начат</th></tr>
+		<tr><th>ID</th><th>Display ID</th><th>Агент</th><th>Шаг</th><th>Статус</th><th>Начат</th></tr>
 		{{range .Runs}}
 		<tr>
 			<td><a href="/runs/{{.ID}}">{{.ID}}</a></td>
+			<td>{{.DisplayID}}</td>
 			<td>{{.Agent}}</td>
 			<td>{{.Step}}</td>
 			<td>{{.Status}}</td>
@@ -25,4 +26,42 @@
 		{{end}}
 	</table>
 </div>
+<div class="card">
+	<h2>Комментарии</h2>
+	<div id="comments">
+		{{range .Comments}}
+		<div class="comment">
+			<div class="comment-meta">{{.CreatedAt | formatTime}} — {{.Author}}</div>
+			<div class="comment-body">{{.Body}}</div>
+		</div>
+		{{else}}
+		<p class="muted">Нет комментариев.</p>
+		{{end}}
+	</div>
+	<form id="comment-form" data-kind="task" data-id="{{.Task.ID}}">
+		<input type="text" id="comment-author" placeholder="Автор" value="system">
+		<textarea id="comment-body" placeholder="Комментарий..."></textarea>
+		<button type="submit">Добавить</button>
+	</form>
+</div>
+<script>
+document.getElementById('comment-form').addEventListener('submit', async function(e) {
+	e.preventDefault();
+	const kind = this.dataset.kind;
+	const id = this.dataset.id;
+	const author = document.getElementById('comment-author').value;
+	const body = document.getElementById('comment-body').value;
+	const res = await fetch(`/api/v1/${kind}s/${id}/comments`, {
+		method: 'POST',
+		headers: {'Content-Type': 'application/json'},
+		body: JSON.stringify({author, body})
+	});
+	if (res.ok) {
+		document.getElementById('comment-body').value = '';
+		window.location.reload();
+	} else {
+		alert('Ошибка добавления комментария');
+	}
+});
+</script>
 {{end}}

@@ -3,8 +3,10 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -102,4 +104,16 @@ func (s *Store) ListJSON(parts []string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// DisplayIDFromInternal returns a stable human-readable ID for legacy objects.
+func (s *Store) DisplayIDFromInternal(kind, internalID string) string {
+	prefix := strings.ToUpper(kind)
+	suffix := internalID
+	if i := strings.LastIndex(internalID, "_"); i >= 0 {
+		suffix = internalID[i+1:]
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(suffix))
+	return fmt.Sprintf("%s-%d", prefix, h.Sum32()%900000+100000)
 }

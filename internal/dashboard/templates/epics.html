@@ -18,10 +18,11 @@
 <div class="card">
 	<h2>Все эпики</h2>
 	<table>
-		<tr><th>ID</th><th>Название</th><th>Проект</th><th>Статус</th></tr>
+		<tr><th>Display ID</th><th>Internal ID</th><th>Название</th><th>Проект</th><th>Статус</th></tr>
 		{{range .Epics}}
 		<tr>
-			<td>{{.ID}}</td>
+			<td><strong>{{.DisplayID}}</strong></td>
+			<td class="muted">{{.ID}}</td>
 			<td>{{.Title}}</td>
 			<td>{{.ProjectID}}</td>
 			<td><span class="badge badge-{{.Status}}">{{.Status}}</span></td>

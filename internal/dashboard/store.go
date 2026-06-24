@@ -12,6 +12,7 @@ import (
 	"control-room/internal/run"
 	"control-room/internal/store"
 	"control-room/internal/task"
+	"control-room/internal/comment"
 	"control-room/internal/team"
 )
 
@@ -127,4 +128,12 @@ func (ds *DashboardStore) RecentRunEvents(runID string, n int) ([]run.Event, err
 		return events[len(events)-n:], nil
 	}
 	return events, nil
+}
+
+func (ds *DashboardStore) Comments(kind, id string) ([]comment.Comment, error) {
+	return comment.List(ds.Store, kind, id)
+}
+
+func (ds *DashboardStore) AddComment(kind, id, author, body string) (*comment.Comment, error) {
+	return comment.Add(ds.Store, kind, id, author, body)
 }

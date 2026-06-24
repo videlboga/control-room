@@ -46,10 +46,11 @@
 <div class="card">
 	<h2>Задачи ({{len .Tasks}})</h2>
 	<table>
-		<tr><th>ID</th><th>Название</th><th>Проект</th><th>Тип</th><th>Статус</th></tr>
+		<tr><th>Display ID</th><th>Internal ID</th><th>Название</th><th>Проект</th><th>Тип</th><th>Статус</th></tr>
 		{{range .Tasks}}
 		<tr>
-			<td><a href="/tasks/{{.ID}}">{{.ID}}</a></td>
+			<td><a href="/tasks/{{.ID}}"><strong>{{.DisplayID}}</strong></a></td>
+			<td class="muted">{{.ID}}</td>
 			<td>{{.Title}}</td>
 			<td>{{.ProjectID}}</td>
 			<td>{{.Type}}</td>

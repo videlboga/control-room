@@ -91,7 +91,9 @@ func New(st *store.Store) http.Handler {
 	mux.HandleFunc("/api/v1/projects/{id}", s.apiProjectDetail)
 	mux.HandleFunc("/api/v1/projects/{id}/docs", s.apiProjectDoc)
 	mux.HandleFunc("/api/v1/epics", s.apiEpics)
+	mux.HandleFunc("/api/v1/epics/{id}/comments", s.apiEpicComments)
 	mux.HandleFunc("/api/v1/tasks", s.apiTasks)
+	mux.HandleFunc("/api/v1/tasks/{id}/comments", s.apiTaskComments)
 	mux.HandleFunc("/api/v1/runs/active", s.apiActiveRuns)
 	mux.HandleFunc("/api/v1/runs/{id}", s.apiRunDetail)
 	mux.HandleFunc("/api/v1/runs/{id}/agent-log", s.apiAgentLog)
@@ -223,7 +225,8 @@ func (s *Server) taskDetailPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	runs, _ := run.ListByTask(s.store.Store, id)
-	render(w, "task", map[string]any{"Task": t, "Runs": runs})
+	comments, _ := s.store.Comments("task", t.ID)
+	render(w, "task", map[string]any{"Task": t, "Runs": runs, "Comments": comments})
 }
 
 func (s *Server) runDetailPage(w http.ResponseWriter, r *http.Request) {
@@ -311,6 +314,66 @@ func (s *Server) apiProjects(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, projects)
 	case http.MethodPost:
 		s.apiProjectCreate(w, r)
+	default:
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) apiEpicComments(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	switch r.Method {
+	case http.MethodGet:
+		comments, _ := s.store.Comments("epic", id)
+		jsonResponse(w, comments)
+	case http.MethodPost:
+		var req struct {
+			Author string `json:"author"`
+			Body   string `json:"body"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Body == "" {
+			jsonError(w, "body is required", http.StatusBadRequest)
+			return
+		}
+		c, err := s.store.AddComment("epic", id, req.Author, req.Body)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		jsonResponse(w, c)
+	default:
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) apiTaskComments(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	switch r.Method {
+	case http.MethodGet:
+		comments, _ := s.store.Comments("task", id)
+		jsonResponse(w, comments)
+	case http.MethodPost:
+		var req struct {
+			Author string `json:"author"`
+			Body   string `json:"body"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Body == "" {
+			jsonError(w, "body is required", http.StatusBadRequest)
+			return
+		}
+		c, err := s.store.AddComment("task", id, req.Author, req.Body)
+		if err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		jsonResponse(w, c)
 	default:
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 	}

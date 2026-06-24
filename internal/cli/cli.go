@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"control-room/internal/comment"
 	"control-room/internal/config"
 	"control-room/internal/epic"
 	"control-room/internal/orchestrator"
@@ -263,7 +264,7 @@ func taskCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Printf("task %s created\n", created.ID)
+			fmt.Printf("task %s (%s) created\n", created.DisplayID, created.ID)
 			return nil
 		},
 	}
@@ -287,7 +288,7 @@ func taskCmd() *cobra.Command {
 				return err
 			}
 			for _, t := range tasks {
-				fmt.Printf("%s\t%s\t%s\t%s\n", t.ID, t.Status, t.ProjectID, t.Title)
+				fmt.Printf("%s\t%s\t%s\t%s\t%s\n", t.DisplayID, t.ID, t.Status, t.ProjectID, t.Title)
 			}
 			return nil
 		},
@@ -310,7 +311,57 @@ func taskCmd() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(create, list, show)
+
+	commentCmd := &cobra.Command{
+		Use:   "comment",
+		Short: "Add or list comments on a task",
+	}
+	commentAdd := &cobra.Command{
+		Use:   "add [task-id]",
+		Short: "Add a comment to a task",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			t, err := task.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			body, _ := cmd.Flags().GetString("body")
+			author, _ := cmd.Flags().GetString("author")
+			created, err := comment.Add(st, "task", t.ID, author, body)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("comment %s added to task %s\n", created.ID, t.DisplayID)
+			return nil
+		},
+	}
+	commentAdd.Flags().String("body", "", "comment text")
+	commentAdd.Flags().String("author", "system", "comment author")
+	_ = commentAdd.MarkFlagRequired("body")
+	commentList := &cobra.Command{
+		Use:   "list [task-id]",
+		Short: "List comments on a task",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			t, err := task.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			comments, err := comment.List(st, "task", t.ID)
+			if err != nil {
+				return err
+			}
+			for _, c := range comments {
+				fmt.Printf("%s\t%s\t%s\n", c.CreatedAt, c.Author, c.Body)
+			}
+			return nil
+		},
+	}
+	commentCmd.AddCommand(commentAdd, commentList)
+
+	cmd.AddCommand(create, list, show, commentCmd)
 	return cmd
 }
 
@@ -337,7 +388,7 @@ func epicCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Printf("epic %s created\n", created.ID)
+			fmt.Printf("epic %s (%s) created\n", created.DisplayID, created.ID)
 			return nil
 		},
 	}
@@ -358,7 +409,7 @@ func epicCmd() *cobra.Command {
 				return err
 			}
 			for _, e := range epics {
-				fmt.Printf("%s\t%s\t%s\t%s\n", e.ID, e.Status, e.ProjectID, e.Title)
+				fmt.Printf("%s\t%s\t%s\t%s\t%s\n", e.DisplayID, e.ID, e.Status, e.ProjectID, e.Title)
 			}
 			return nil
 		},
@@ -380,7 +431,57 @@ func epicCmd() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(create, list, show)
+
+	commentCmd := &cobra.Command{
+		Use:   "comment",
+		Short: "Add or list comments on an epic",
+	}
+	commentAdd := &cobra.Command{
+		Use:   "add [epic-id]",
+		Short: "Add a comment to an epic",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			e, err := epic.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			body, _ := cmd.Flags().GetString("body")
+			author, _ := cmd.Flags().GetString("author")
+			created, err := comment.Add(st, "epic", e.ID, author, body)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("comment %s added to epic %s\n", created.ID, e.DisplayID)
+			return nil
+		},
+	}
+	commentAdd.Flags().String("body", "", "comment text")
+	commentAdd.Flags().String("author", "system", "comment author")
+	_ = commentAdd.MarkFlagRequired("body")
+	commentList := &cobra.Command{
+		Use:   "list [epic-id]",
+		Short: "List comments on an epic",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			e, err := epic.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			comments, err := comment.List(st, "epic", e.ID)
+			if err != nil {
+				return err
+			}
+			for _, c := range comments {
+				fmt.Printf("%s\t%s\t%s\n", c.CreatedAt, c.Author, c.Body)
+			}
+			return nil
+		},
+	}
+	commentCmd.AddCommand(commentAdd, commentList)
+
+	cmd.AddCommand(create, list, show, commentCmd)
 	return cmd
 }
 
@@ -444,7 +545,22 @@ func orchestrateCmd() *cobra.Command {
 	watch.Flags().Bool("manual-approve", false, "prompt for manual approval on QA verify tasks")
 	_ = watch.MarkFlagRequired("epic")
 
-	cmd.AddCommand(run, watch)
+	watchAll := &cobra.Command{
+		Use:   "watch-all",
+		Short: "Start detached watch for all in-progress epics (one sweep)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			cr := &orchestrator.WatchCron{Store: st}
+			started, err := cr.Run()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("started watch for %d epic(s)\n", started)
+			return nil
+		},
+	}
+
+	cmd.AddCommand(run, watch, watchAll)
 	return cmd
 }
 
@@ -482,7 +598,7 @@ func runCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Printf("run %s started for task %s\n", r.ID, taskID)
+			fmt.Printf("run %s (%s) started for task %s\n", r.DisplayID, r.ID, taskID)
 			return run.WaitFor(st, r.ID, func(ev run.Event) {
 				ts := ev.Timestamp
 				if len(ts) > 19 {

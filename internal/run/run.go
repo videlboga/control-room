@@ -25,6 +25,7 @@ import (
 // Run is a concrete task execution.
 type Run struct {
 	ID        string            `json:"id" yaml:"id"`
+	DisplayID string            `json:"display_id,omitempty" yaml:"display_id,omitempty"`
 	TaskID    string            `json:"task_id" yaml:"task_id"`
 	ProjectID string            `json:"project_id" yaml:"project_id"`
 	TeamID    string            `json:"team_id" yaml:"team_id"`
@@ -91,6 +92,13 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 			"task_title": t.Title,
 			"team_name":  te.Name,
 		},
+	}
+	cfg, _ := config.LoadOrCreate(st.Root)
+	if cfg != nil {
+		did, err := cfg.NextDisplayID("run")
+		if err == nil {
+			r.DisplayID = did
+		}
 	}
 	_ = st.EnsureDir("runs", runID)
 	_ = ensureHermesOwnership(st.Root, user)
@@ -216,7 +224,11 @@ func seedWorktreeDocs(st *store.Store, r *Run, p *project.Project, wt string) er
 func Get(st *store.Store, id string) (*Run, error) {
 	var r Run
 	err := st.ReadJSON([]string{"runs", id, "run.json"}, &r)
-	return &r, err
+	if err != nil {
+		return &r, err
+	}
+	ensureDisplayID(st, &r)
+	return &r, nil
 }
 
 // ListByTask returns all runs for a given task ID.
@@ -232,6 +244,12 @@ func ListByTask(st *store.Store, taskID string) ([]Run, error) {
 		}
 	}
 	return out, nil
+}
+
+func ensureDisplayID(st *store.Store, r *Run) {
+	if r.DisplayID == "" {
+		r.DisplayID = st.DisplayIDFromInternal("run", r.ID)
+	}
 }
 
 // List all runs.
@@ -250,6 +268,7 @@ func List(st *store.Store) ([]Run, error) {
 		}
 		var r Run
 		if err := st.ReadJSON([]string{"runs", e.Name(), "run.json"}, &r); err == nil {
+			ensureDisplayID(st, &r)
 			out = append(out, r)
 		}
 	}

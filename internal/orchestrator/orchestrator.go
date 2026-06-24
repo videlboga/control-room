@@ -70,10 +70,12 @@ func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{}))
 // runEpicLoop is the shared orchestration engine for both RunEpic (sequential)
 // and WatchEpic (parallel batch) modes.
 func (o *Orchestrator) runEpicLoop(epicID string, parallel bool, cb func(string, ...interface{})) error {
-	e, err := epic.Get(o.Store, epicID)
+	resolved, err := epic.Resolve(o.Store, epicID)
 	if err != nil {
 		return err
 	}
+	epicID = resolved.ID
+	e := resolved
 	if e.Status == "done" {
 		return errors.New("epic already done")
 	}
