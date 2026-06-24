@@ -721,7 +721,18 @@ func storeFromFlags(cmd *cobra.Command) *store.Store {
 		root = config.DefaultWorkspace()
 	}
 	cfg, _ := config.LoadOrCreate(root)
-	s := store.New(root)
+	var s *store.Store
+	if cfg != nil && cfg.Backend == "postgres" {
+		b, err := store.NewPostgresBackend(root, cfg.PostgresDSN)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "postgres backend failed, falling back to json: %v\n", err)
+			s = store.New(root)
+		} else {
+			s = store.NewWithBackend(root, b)
+		}
+	} else {
+		s = store.New(root)
+	}
 	if cfg != nil {
 		s.HermesUser = cfg.HermesUser
 		s.HermesSourceProfile = cfg.HermesSourceProfile

@@ -4,8 +4,8 @@ go 1.26.3
 
 require (
 	github.com/google/uuid v1.6.0
+	github.com/lib/pq v1.12.3
 	github.com/spf13/cobra v1.10.2
-	golang.org/x/sys v0.46.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

@@ -8,9 +8,9 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strconv"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -52,7 +52,7 @@ func LoadTemplates() error {
 		},
 	}
 	pageTemplates = map[string]*template.Template{}
-	pages := []string{"index", "agents", "projects", "project", "epics", "tasks", "task", "run"}
+	pages := []string{"index", "agents", "projects", "project", "epics", "tasks", "task", "run", "board"}
 	for _, page := range pages {
 		t, err := template.New("layout").Funcs(funcMap).ParseFS(templatesFS,
 			"templates/layout.html",
@@ -82,6 +82,7 @@ func New(st *store.Store) http.Handler {
 	mux.HandleFunc("/projects/{id}", s.projectDetailPage)
 	mux.HandleFunc("/epics", s.epicsPage)
 	mux.HandleFunc("/tasks", s.tasksPage)
+	mux.HandleFunc("/board", s.boardPage)
 	mux.HandleFunc("/tasks/{id}", s.taskDetailPage)
 	mux.HandleFunc("/runs/{id}", s.runDetailPage)
 
@@ -93,6 +94,7 @@ func New(st *store.Store) http.Handler {
 	mux.HandleFunc("/api/v1/epics", s.apiEpics)
 	mux.HandleFunc("/api/v1/epics/{id}/comments", s.apiEpicComments)
 	mux.HandleFunc("/api/v1/tasks", s.apiTasks)
+	mux.HandleFunc("/api/v1/tasks/{id}", s.apiTaskUpdate)
 	mux.HandleFunc("/api/v1/tasks/{id}/comments", s.apiTaskComments)
 	mux.HandleFunc("/api/v1/runs/active", s.apiActiveRuns)
 	mux.HandleFunc("/api/v1/runs/{id}", s.apiRunDetail)
@@ -202,7 +204,7 @@ func (s *Server) tasksPage(w http.ResponseWriter, r *http.Request) {
 	projects, _ := s.store.ListProjects()
 	teams, _ := s.store.ListTeams()
 	statuses := []string{"open", "in_progress", "pending_review", "approved", "rejected", "done"}
-	types := []string{"research", "qa_review", "pm_plan", "engineering", "qa_verify", "pm_consistency"}
+	types := []string{"research", "qa_review", "pm_plan", "engineering", "qa_verify", "pm_consistency", "recovery"}
 
 	render(w, "tasks", map[string]any{
 		"Tasks":        filtered,
@@ -214,6 +216,54 @@ func (s *Server) tasksPage(w http.ResponseWriter, r *http.Request) {
 		"FilterAgent":  filterAgent,
 		"FilterStatus": filterStatus,
 		"FilterType":   filterType,
+	})
+}
+
+func (s *Server) boardPage(w http.ResponseWriter, r *http.Request) {
+	filterProject := r.URL.Query().Get("project")
+	filterAgent := r.URL.Query().Get("agent")
+	filterType := r.URL.Query().Get("type")
+
+	tasks, _ := s.store.ListTasks()
+	projects, _ := s.store.ListProjects()
+	teams, _ := s.store.ListTeams()
+	statuses := []string{"open", "in_progress", "pending_review", "approved", "rejected", "done"}
+	types := []string{"research", "qa_review", "pm_plan", "engineering", "qa_verify", "pm_consistency", "recovery"}
+
+	type column struct {
+		Status string
+		Tasks  []task.Task
+	}
+	var columns []column
+	for _, st := range statuses {
+		var col column
+		col.Status = st
+		for _, t := range tasks {
+			if string(t.Status) != st {
+				continue
+			}
+			if filterProject != "" && t.ProjectID != filterProject {
+				continue
+			}
+			if filterAgent != "" && t.AssignedProfile != filterAgent && t.TeamID != filterAgent {
+				continue
+			}
+			if filterType != "" && string(t.Type) != filterType {
+				continue
+			}
+			col.Tasks = append(col.Tasks, t)
+		}
+		columns = append(columns, col)
+	}
+
+	render(w, "board", map[string]any{
+		"Columns":    columns,
+		"Projects":   projects,
+		"Teams":      teams,
+		"Types":      types,
+		"FilterProj": filterProject,
+		"FilterAgent": filterAgent,
+		"FilterType": filterType,
 	})
 }
 
@@ -344,6 +394,38 @@ func (s *Server) apiEpicComments(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonResponse(w, c)
+	default:
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) apiTaskUpdate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	t, err := s.store.GetTask(id)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		jsonResponse(w, t)
+	case http.MethodPatch:
+		var req struct {
+			Status string `json:"status"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			jsonError(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Status != "" {
+			t.Status = task.TaskStatus(req.Status)
+		}
+		if err := s.store.UpdateTask(t); err != nil {
+			jsonError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.eventsBroadcaster.Notify()
+		jsonResponse(w, t)
 	default:
 		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
 	}

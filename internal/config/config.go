@@ -21,6 +21,8 @@ type WorkspaceConfig struct {
 	HermesSourceProfile string       `yaml:"hermes_source_profile"`
 	MaxConcurrentRuns   int          `yaml:"max_concurrent_runs"`
 	StubMode            bool         `yaml:"stub_mode"`
+	Backend             string       `yaml:"backend,omitempty"`
+	PostgresDSN         string       `yaml:"postgres_dsn,omitempty"`
 	EpicSeq             int          `yaml:"epic_seq,omitempty"`
 	TaskSeq             int          `yaml:"task_seq,omitempty"`
 	RunSeq              int          `yaml:"run_seq,omitempty"`

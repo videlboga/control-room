@@ -61,6 +61,10 @@ func (ds *DashboardStore) GetTask(id string) (*task.Task, error) {
 	return task.Get(ds.Store, id)
 }
 
+func (ds *DashboardStore) UpdateTask(t *task.Task) error {
+	return task.Update(ds.Store, t)
+}
+
 func (ds *DashboardStore) CreateTask(t *task.Task) (*task.Task, error) {
 	return task.Create(ds.Store, t)
 }
