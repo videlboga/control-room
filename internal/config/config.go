@@ -9,20 +9,79 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
 // WorkspaceConfig holds top-level workspace settings.
 type WorkspaceConfig struct {
-	Root                string `yaml:"root"`
-	HermesUser          string `yaml:"hermes_user"`
-	HermesSourceProfile string `yaml:"hermes_source_profile"`
-	MaxConcurrentRuns   int    `yaml:"max_concurrent_runs"`
-	StubMode            bool   `yaml:"stub_mode"`
-	EpicSeq             int    `yaml:"epic_seq,omitempty"`
-	TaskSeq             int    `yaml:"task_seq,omitempty"`
-	RunSeq              int    `yaml:"run_seq,omitempty"`
+	Root                string       `yaml:"root"`
+	HermesUser          string       `yaml:"hermes_user"`
+	HermesSourceProfile string       `yaml:"hermes_source_profile"`
+	MaxConcurrentRuns   int          `yaml:"max_concurrent_runs"`
+	StubMode            bool         `yaml:"stub_mode"`
+	EpicSeq             int          `yaml:"epic_seq,omitempty"`
+	TaskSeq             int          `yaml:"task_seq,omitempty"`
+	RunSeq              int          `yaml:"run_seq,omitempty"`
+	Policy              TaskPolicy   `yaml:"policy,omitempty"`
+}
+
+// TaskPolicy configures completion behaviour for gate tasks.
+type TaskPolicy struct {
+	// RequireDispositionFor lists task types that must produce an explicit
+	// verdict+next_status. If the agent returns neither approve nor reject,
+	// the orchestrator rejects the task instead of looping.
+	RequireDispositionFor []string `yaml:"require_disposition_for,omitempty"`
+	// AutoApproveAfter is a duration (e.g. "24h") after which a task stuck in
+	// pending_review without a valid verdict is auto-approved.
+	AutoApproveAfter string `yaml:"auto_approve_after,omitempty"`
+	// HumanOverrideFor lists task types that require human approval even when
+	// the agent returns approve. The orchestrator Prompt is used.
+	HumanOverrideFor []string `yaml:"human_override_for,omitempty"`
+	// MaxRedoAttempts is the per-task redo limit. When exceeded the task is
+	// escalated to the recovery team/agent instead of creating another redo.
+	MaxRedoAttempts int `yaml:"max_redo_attempts,omitempty"`
+}
+
+// RequiresDisposition reports whether a task type must produce an explicit verdict.
+func (p TaskPolicy) RequiresDisposition(tt string) bool {
+	for _, t := range p.RequireDispositionFor {
+		if strings.EqualFold(t, tt) {
+			return true
+		}
+	}
+	return false
+}
+
+// RequiresHumanOverride reports whether a task type needs human approval.
+func (p TaskPolicy) RequiresHumanOverride(tt string) bool {
+	for _, t := range p.HumanOverrideFor {
+		if strings.EqualFold(t, tt) {
+			return true
+		}
+	}
+	return false
+}
+
+// MaxRedo returns the configured redo limit, defaulting to 10.
+func (p TaskPolicy) MaxRedo() int {
+	if p.MaxRedoAttempts <= 0 {
+		return 10
+	}
+	return p.MaxRedoAttempts
+}
+
+// AutoApproveDuration parses AutoApproveAfter; zero means disabled.
+func (p TaskPolicy) AutoApproveDuration() time.Duration {
+	if p.AutoApproveAfter == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(p.AutoApproveAfter)
+	if err != nil {
+		return 0
+	}
+	return d
 }
 
 const (

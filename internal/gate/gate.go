@@ -23,6 +23,10 @@ type Result struct {
 
 // Run executes hard checks for a task before a verdict can be trusted.
 func Run(st *store.Store, t *task.Task, r *run.Run, p *project.Project) (*Result, error) {
+	// Recovery tasks are handled by a senior agent outside of normal gating.
+	if t.Type == task.TypeRecovery {
+		return &Result{Passed: true}, nil
+	}
 	switch t.Type {
 	case task.TypeResearch:
 		return runResearchChecks(st, t, r, p)

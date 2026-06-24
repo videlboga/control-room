@@ -12,12 +12,14 @@ import (
 	"sync"
 	"time"
 
+	"control-room/internal/config"
 	"control-room/internal/epic"
 	"control-room/internal/gate"
 	"control-room/internal/project"
 	"control-room/internal/run"
 	"control-room/internal/store"
 	"control-room/internal/task"
+	"control-room/internal/team"
 )
 
 // Orchestrator drives a deterministic workflow state machine for an Epic.
@@ -218,7 +220,8 @@ func (o *Orchestrator) runTaskToVerdict(t *task.Task, r *run.Run, cb func(string
 		reason = "no valid verdict in run metadata: " + verdictErr.Error()
 	}
 
-	if o.ManualApprove && t.Type == task.TypeQAVerify && verdict == "approve" {
+	// Policy: human-in-the-loop override for configured task types.
+	if verdict == "approve" && o.policy().RequiresHumanOverride(string(t.Type)) {
 		if o.Prompt != nil {
 			cb("awaiting_manual_approval", t.ID)
 			verdict, reason = o.Prompt(t.ID)
@@ -253,7 +256,45 @@ func (o *Orchestrator) runTaskToVerdict(t *task.Task, r *run.Run, cb func(string
 		}
 	}
 
+	// Policy: require explicit disposition, auto-approve stale pending tasks.
+	verdict, reason = o.applyPolicy(t, verdict, reason)
+	if t.Verdict != verdict || t.VerdictReason != reason {
+		t.Verdict = verdict
+		t.VerdictReason = reason
+		_ = task.Update(o.Store, t)
+		cb("task_verdict", t.ID, verdict, reason)
+	}
+
 	return verdict, reason, nil
+}
+
+// policy returns the workspace task policy, defaulting to sane values.
+func (o *Orchestrator) policy() config.TaskPolicy {
+	cfg, err := config.LoadOrCreate(o.Store.Root)
+	if err != nil {
+		return config.TaskPolicy{}
+	}
+	return cfg.Policy
+}
+
+// applyPolicy enforces require_disposition_for and auto_approve_after.
+// It mutates t.Status and t.EndedAt when auto-approving.
+func (o *Orchestrator) applyPolicy(t *task.Task, verdict, reason string) (string, string) {
+	pol := o.policy()
+
+	// Require explicit disposition: anything other than approve/reject is rejected.
+	if !t.HasValidVerdict() && pol.RequiresDisposition(string(t.Type)) {
+		return "reject", "policy requires explicit disposition: " + t.DispositionReason()
+	}
+
+	// Auto-approve tasks stuck in pending_review beyond the configured duration.
+	if verdict != "approve" && pol.AutoApproveDuration() > 0 && t.IsStale(pol.AutoApproveDuration()) {
+		t.Status = task.StatusApproved
+		t.EndedAt = time.Now().UTC().Format(time.RFC3339)
+		return "approve", "policy auto-approve after " + pol.AutoApproveAfter
+	}
+
+	return verdict, reason
 }
 
 func (o *Orchestrator) applyTaskResolution(t *task.Task, verdict, reason string, e *epic.Epic, proj *project.Project, cb func(string, ...interface{})) error {
@@ -308,8 +349,24 @@ func (o *Orchestrator) applyTaskResolution(t *task.Task, verdict, reason string,
 		return nil
 	}
 
+	// Reject path: normal redo or senior/recovery escalation when max redo reached.
 	t.Status = task.StatusRejected
+	t.EndedAt = time.Now().UTC().Format(time.RFC3339)
 	_ = task.Update(o.Store, t)
+
+	pol := o.policy()
+	if t.RedoIndex >= pol.MaxRedo()-1 && t.EscalatedTo == "" {
+		recoveryTask, err := o.escalateToSenior(t, e, proj, reason)
+		if err != nil {
+			cb("escalation_error", t.ID, err)
+			// Fallback to normal redo if no senior agent is configured.
+		} else {
+			cb("escalated_to_senior", recoveryTask.ID, recoveryTask.AssignedAgentName, reason)
+			// Do not create a normal redo; the recovery task is a fresh group for
+			// the senior agent to take over manually.
+			return nil
+		}
+	}
 
 	redoType := transitions[t.Type]["rejected"]
 	if redoType == "" {
@@ -328,6 +385,60 @@ func (o *Orchestrator) applyTaskResolution(t *task.Task, verdict, reason string,
 	}
 	cb("redo_created", redo.ID, redoType, reason)
 	return nil
+}
+
+// escalateToSenior creates a recovery task assigned to a senior/recovery agent.
+// The rejected base task is marked done; the recovery task inherits the base's
+// upstream dependencies so it can run immediately.
+func (o *Orchestrator) escalateToSenior(base *task.Task, e *epic.Epic, proj *project.Project, reason string) (*task.Task, error) {
+	seniorTeam, seniorAgent, profile := o.findSeniorAgent(proj.DefaultTeam)
+	if seniorTeam == "" || seniorAgent == "" {
+		return nil, errors.New("no senior/recovery agent configured in team " + proj.DefaultTeam)
+	}
+	base.Status = task.StatusDone
+	base.EndedAt = time.Now().UTC().Format(time.RFC3339)
+	base.Verdict = "escalated"
+	base.VerdictReason = "max redo reached; escalated to senior: " + reason
+	if err := task.Update(o.Store, base); err != nil {
+		return nil, err
+	}
+	recovery := &task.Task{
+		Title:             "Recovery: " + base.Title,
+		Description:       base.Description,
+		Type:              task.TypeRecovery,
+		ProjectID:         e.ProjectID,
+		EpicID:            e.ID,
+		ParentID:          base.ID,
+		TeamID:            seniorTeam,
+		AssignedAgentName: seniorAgent,
+		AssignedProfile:   profile,
+		Dependencies:      append([]string(nil), base.Dependencies...),
+		Group:             base.Group,
+		EscalatedTo:       seniorAgent,
+		EscalatedAt:       time.Now().UTC().Format(time.RFC3339),
+	}
+	if created, err := task.Create(o.Store, recovery); err != nil {
+		return nil, err
+	} else {
+		return created, nil
+	}
+}
+
+// findSeniorAgent looks for an agent with role senior/recovery/lead in the given team.
+// It returns teamID, agentName, profile. Empty strings mean not found.
+func (o *Orchestrator) findSeniorAgent(teamID string) (string, string, string) {
+	tm, err := team.Get(o.Store, teamID)
+	if err != nil {
+		return "", "", ""
+	}
+	for _, role := range []string{"senior", "recovery", "lead"} {
+		for name, ref := range tm.Agents {
+			if strings.EqualFold(ref.Role, role) {
+				return tm.ID, name, ref.Profile
+			}
+		}
+	}
+	return "", "", ""
 }
 
 // Expand first-run helpers.

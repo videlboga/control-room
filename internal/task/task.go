@@ -18,16 +18,17 @@ import (
 type TaskType string
 
 const (
-	TypeResearch       TaskType = "research"
-	TypeQAReview       TaskType = "qa_review"
-	TypePMPlan         TaskType = "pm_plan"
-	TypeEngineering    TaskType = "engineering"
-	TypeQAVerify       TaskType = "qa_verify"
-	TypePMConsistency  TaskType = "pm_consistency"
+	TypeResearch      TaskType = "research"
+	TypeQAReview      TaskType = "qa_review"
+	TypePMPlan        TaskType = "pm_plan"
+	TypeEngineering   TaskType = "engineering"
+	TypeQAVerify      TaskType = "qa_verify"
+	TypePMConsistency TaskType = "pm_consistency"
+	TypeRecovery      TaskType = "recovery"
 )
 
 // Valid task types.
-var TaskTypes = []TaskType{TypeResearch, TypeQAReview, TypePMPlan, TypeEngineering, TypeQAVerify, TypePMConsistency}
+var TaskTypes = []TaskType{TypeResearch, TypeQAReview, TypePMPlan, TypeEngineering, TypeQAVerify, TypePMConsistency, TypeRecovery}
 
 // TaskStatus is the lifecycle of a single task.
 type TaskStatus string
@@ -65,6 +66,44 @@ type Task struct {
 	StartedAt         string     `json:"started_at,omitempty" yaml:"started_at,omitempty"`
 	EndedAt           string     `json:"ended_at,omitempty" yaml:"ended_at,omitempty"`
 	Metadata          map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	// Escalation tracks when this task was moved to senior/recovery after max redo.
+	EscalatedTo       string     `json:"escalated_to,omitempty" yaml:"escalated_to,omitempty"`
+	EscalatedAt       string     `json:"escalated_at,omitempty" yaml:"escalated_at,omitempty"`
+}
+
+// HasValidVerdict returns true when the task produced approve or reject.
+func (t *Task) HasValidVerdict() bool {
+	return t.Verdict == "approve" || t.Verdict == "reject"
+}
+
+// IsStale reports whether the task has been pending_review longer than d.
+func (t *Task) IsStale(d time.Duration) bool {
+	if d <= 0 {
+		return false
+	}
+	ref := t.EndedAt
+	if ref == "" {
+		ref = t.StartedAt
+	}
+	if ref == "" {
+		ref = t.CreatedAt
+	}
+	if ref == "" {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, ref)
+	if err != nil {
+		return false
+	}
+	return time.Since(ts) > d
+}
+
+// DispositionReason returns a short text describing why the task has no verdict.
+func (t *Task) DispositionReason() string {
+	if t.Verdict == "" {
+		return "no verdict produced by agent"
+	}
+	return "invalid verdict: " + t.Verdict
 }
 
 func IsValidTaskType(t string) bool {

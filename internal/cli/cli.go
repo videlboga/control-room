@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"control-room/internal/store"
 	"control-room/internal/task"
 	"control-room/internal/team"
+	"gopkg.in/yaml.v3"
 	"github.com/spf13/cobra"
 )
 
@@ -62,6 +64,7 @@ func NewRootCmd() *cobra.Command {
 	rootCmd.AddCommand(taskCmd())
 	rootCmd.AddCommand(orchestrateCmd())
 	rootCmd.AddCommand(runCmd())
+	rootCmd.AddCommand(workspaceCmd())
 	return rootCmd
 }
 
@@ -741,3 +744,78 @@ func storeFromFlags(cmd *cobra.Command) *store.Store {
 }
 
 var _ = time.Now
+
+func workspaceCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "workspace", Short: "Inspect and configure the workspace"}
+
+	policy := &cobra.Command{
+		Use:   "policy",
+		Short: "Show current workspace policy",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, _ := cmd.Flags().GetString("workspace")
+			if root == "" {
+				root = config.DefaultWorkspace()
+			}
+			cfg, err := config.LoadOrCreate(root)
+			if err != nil {
+				return err
+			}
+			data, err := yaml.Marshal(cfg.Policy)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("workspace: %s\n%s\n", root, string(data))
+			return nil
+		},
+	}
+
+	set := &cobra.Command{
+		Use:   "set-policy",
+		Short: "Set workspace policy flags",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, _ := cmd.Flags().GetString("workspace")
+			if root == "" {
+				root = config.DefaultWorkspace()
+			}
+			cfg, err := config.LoadOrCreate(root)
+			if err != nil {
+				return err
+			}
+			if cfg.Policy.RequireDispositionFor == nil {
+				cfg.Policy.RequireDispositionFor = []string{}
+			}
+			if cfg.Policy.HumanOverrideFor == nil {
+				cfg.Policy.HumanOverrideFor = []string{}
+			}
+			if v, err := cmd.Flags().GetStringSlice("require-disposition"); err == nil {
+				cfg.Policy.RequireDispositionFor = v
+			}
+			if v, err := cmd.Flags().GetStringSlice("human-override"); err == nil {
+				cfg.Policy.HumanOverrideFor = v
+			}
+			if v, err := cmd.Flags().GetString("auto-approve-after"); err == nil && v != "" {
+				cfg.Policy.AutoApproveAfter = v
+			}
+			if v, err := cmd.Flags().GetInt("max-redo"); err == nil && v > 0 {
+				cfg.Policy.MaxRedoAttempts = v
+			}
+			data, err := yaml.Marshal(cfg)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(root, "workspace.yaml"), data, 0o644); err != nil {
+				return err
+			}
+			fmt.Println("workspace policy updated")
+			return nil
+		},
+	}
+	set.Flags().StringSlice("require-disposition", []string{}, "task types that must produce an explicit verdict (e.g. qa_verify,pm_consistency)")
+	set.Flags().StringSlice("human-override", []string{}, "task types that require human approval (e.g. qa_verify)")
+	set.Flags().String("auto-approve-after", "", "auto-approve pending tasks after duration (e.g. 24h)")
+	set.Flags().Int("max-redo", 0, "max redo attempts before senior escalation")
+
+	cmd.AddCommand(policy, set)
+	return cmd
+}
+
