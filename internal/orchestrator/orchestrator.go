@@ -66,6 +66,17 @@ func (o *Orchestrator) RunEpic(epicID string, cb func(string, ...interface{})) e
 // WatchEpic runs a detached-style orchestration loop. It starts every ready task
 // in parallel, waits for all of them, then applies transitions and repeats.
 func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{})) error {
+	// Acquire watch lock to prevent duplicate watch processes on the same epic.
+	lockPath := filepath.Join(o.Store.Root, ".watch-lock", epicID+".lock")
+	if isLocked(lockPath) {
+		return fmt.Errorf("epic %s is already being watched (lock held by another process)", epicID)
+	}
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return fmt.Errorf("create watch-lock dir: %w", err)
+	}
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d", os.Getpid())), 0o644); err != nil {
+		return fmt.Errorf("write watch-lock: %w", err)
+	}
 	defer o.cleanupWatchLock(epicID)
 	return o.runEpicLoop(epicID, true, cb)
 }
