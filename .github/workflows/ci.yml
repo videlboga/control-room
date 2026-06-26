@@ -35,7 +35,7 @@ jobs:
 
       - name: Build frontend
         run: |
-          cd dashboard-frontend && npx vite build
+          cd dashboard-frontend && npm install && npx vite build
 
       - name: Upload cr binary
         uses: actions/upload-artifact@v4
