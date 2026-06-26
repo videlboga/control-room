@@ -2,10 +2,14 @@ package task
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"control-room/internal/config"
+	"control-room/internal/epic"
 	"control-room/internal/store"
 )
 
@@ -14,16 +18,17 @@ import (
 type TaskType string
 
 const (
-	TypeResearch       TaskType = "research"
-	TypeQAReview       TaskType = "qa_review"
-	TypePMPlan         TaskType = "pm_plan"
-	TypeEngineering    TaskType = "engineering"
-	TypeQAVerify       TaskType = "qa_verify"
-	TypePMConsistency  TaskType = "pm_consistency"
+	TypeResearch      TaskType = "research"
+	TypeQAReview      TaskType = "qa_review"
+	TypePMPlan        TaskType = "pm_plan"
+	TypeEngineering   TaskType = "engineering"
+	TypeQAVerify      TaskType = "qa_verify"
+	TypePMConsistency TaskType = "pm_consistency"
+	TypeRecovery      TaskType = "recovery"
 )
 
 // Valid task types.
-var TaskTypes = []TaskType{TypeResearch, TypeQAReview, TypePMPlan, TypeEngineering, TypeQAVerify, TypePMConsistency}
+var TaskTypes = []TaskType{TypeResearch, TypeQAReview, TypePMPlan, TypeEngineering, TypeQAVerify, TypePMConsistency, TypeRecovery}
 
 // TaskStatus is the lifecycle of a single task.
 type TaskStatus string
@@ -40,6 +45,7 @@ const (
 // Task is a concrete workflow step.
 type Task struct {
 	ID                string     `json:"id" yaml:"id"`
+	DisplayID         string     `json:"display_id,omitempty" yaml:"display_id,omitempty"`
 	Title             string     `json:"title" yaml:"title"`
 	Description       string     `json:"description,omitempty" yaml:"description,omitempty"`
 	Type              TaskType   `json:"type" yaml:"type"`
@@ -60,6 +66,45 @@ type Task struct {
 	StartedAt         string     `json:"started_at,omitempty" yaml:"started_at,omitempty"`
 	EndedAt           string     `json:"ended_at,omitempty" yaml:"ended_at,omitempty"`
 	Metadata          map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	// Escalation tracks when this task was moved to senior/recovery after max redo.
+	EscalatedTo       string     `json:"escalated_to,omitempty" yaml:"escalated_to,omitempty"`
+	EscalatedAt       string     `json:"escalated_at,omitempty" yaml:"escalated_at,omitempty"`
+	RuntimeConfig     config.RuntimeConfig `json:"runtime_config,omitempty" yaml:"runtime_config,omitempty"`
+}
+
+// HasValidVerdict returns true when the task produced approve or reject.
+func (t *Task) HasValidVerdict() bool {
+	return t.Verdict == "approve" || t.Verdict == "reject"
+}
+
+// IsStale reports whether the task has been pending_review longer than d.
+func (t *Task) IsStale(d time.Duration) bool {
+	if d <= 0 {
+		return false
+	}
+	ref := t.EndedAt
+	if ref == "" {
+		ref = t.StartedAt
+	}
+	if ref == "" {
+		ref = t.CreatedAt
+	}
+	if ref == "" {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, ref)
+	if err != nil {
+		return false
+	}
+	return time.Since(ts) > d
+}
+
+// DispositionReason returns a short text describing why the task has no verdict.
+func (t *Task) DispositionReason() string {
+	if t.Verdict == "" {
+		return "no verdict produced by agent"
+	}
+	return "invalid verdict: " + t.Verdict
 }
 
 func IsValidTaskType(t string) bool {
@@ -84,6 +129,16 @@ func Create(st *store.Store, t *Task) (*Task, error) {
 	if t.ID == "" {
 		t.ID = "task_" + uuid.New().String()[:8]
 	}
+	if t.DisplayID == "" {
+		cfg, err := config.LoadOrCreate(st.Root)
+		if err == nil {
+			did, err := cfg.NextDisplayID("task")
+			if err != nil {
+				return nil, err
+			}
+			t.DisplayID = did
+		}
+	}
 	if t.Status == "" {
 		t.Status = StatusOpen
 	}
@@ -97,9 +152,36 @@ func Create(st *store.Store, t *Task) (*Task, error) {
 }
 
 func Get(st *store.Store, id string) (*Task, error) {
+	if id != "" && !strings.HasPrefix(id, "task_") {
+		return Resolve(st, id)
+	}
 	var t Task
 	err := st.ReadJSON([]string{"tasks", id + ".json"}, &t)
-	return &t, err
+	if err != nil {
+		return &t, err
+	}
+	ensureDisplayID(st, &t)
+	return &t, nil
+}
+
+// Resolve returns the task identified by either its internal ID or DisplayID.
+func Resolve(st *store.Store, id string) (*Task, error) {
+	if id == "" {
+		return nil, errors.New("task id is required")
+	}
+	if strings.HasPrefix(id, "task_") {
+		return Get(st, id)
+	}
+	all, err := List(st)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range all {
+		if t.ID == id || t.DisplayID == id {
+			return &t, nil
+		}
+	}
+	return nil, fmt.Errorf("task not found: %s", id)
 }
 
 func List(st *store.Store) ([]Task, error) {
@@ -114,6 +196,7 @@ func List(st *store.Store) ([]Task, error) {
 	for _, n := range names {
 		var t Task
 		if err := st.ReadJSON([]string{"tasks", n}, &t); err == nil {
+			ensureDisplayID(st, &t)
 			out = append(out, t)
 		}
 	}
@@ -140,6 +223,12 @@ func ListByProject(st *store.Store, projectID string) ([]Task, error) {
 
 // ListByEpic returns tasks belonging to an epic.
 func ListByEpic(st *store.Store, epicID string) ([]Task, error) {
+	if epicID != "" && !strings.HasPrefix(epicID, "epic_") {
+		e, err := epic.Resolve(st, epicID)
+		if err == nil {
+			epicID = e.ID
+		}
+	}
 	tasks, err := List(st)
 	if err != nil {
 		return nil, err
@@ -157,6 +246,12 @@ func Update(st *store.Store, t *Task) error {
 	return st.WriteJSON([]string{"tasks", t.ID + ".json"}, t)
 }
 
+func ensureDisplayID(st *store.Store, t *Task) {
+	if t.DisplayID == "" {
+		t.DisplayID = st.DisplayIDFromInternal("task", t.ID)
+	}
+}
+
 // Redo creates a new task in the same group, advancing redo_index.
 func Redo(st *store.Store, base *Task, reason string) (*Task, error) {
 	maxIdx := base.RedoIndex
@@ -171,6 +266,7 @@ func Redo(st *store.Store, base *Task, reason string) (*Task, error) {
 	}
 	next := *base
 	next.ID = ""
+	next.DisplayID = ""
 	next.Status = StatusOpen
 	next.Verdict = ""
 	next.VerdictReason = reason

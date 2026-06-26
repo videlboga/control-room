@@ -5,40 +5,42 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
-
-	"golang.org/x/sys/unix"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"control-room/internal/config"
 	"control-room/internal/project"
 	"control-room/internal/store"
 	"control-room/internal/task"
 	"control-room/internal/team"
-	"github.com/google/uuid"
 )
 
 // Run is a concrete task execution.
 type Run struct {
-	ID        string            `json:"id" yaml:"id"`
-	TaskID    string            `json:"task_id" yaml:"task_id"`
-	ProjectID string            `json:"project_id" yaml:"project_id"`
-	TeamID    string            `json:"team_id" yaml:"team_id"`
-	Status    string            `json:"status" yaml:"status"`
-	Branch    string            `json:"branch" yaml:"branch"`
-	Worktree  string            `json:"worktree" yaml:"worktree"`
-	Agent     string            `json:"agent" yaml:"agent"`
-	Step      string            `json:"step" yaml:"step"`
-	Errors    int               `json:"errors" yaml:"errors"`
-	Summary   string            `json:"summary,omitempty" yaml:"summary,omitempty"`
-	StartedAt string            `json:"started_at" yaml:"started_at"`
-	EndedAt   string            `json:"ended_at,omitempty" yaml:"ended_at,omitempty"`
-	Metadata  map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	ID            string            `json:"id" yaml:"id"`
+	DisplayID     string            `json:"display_id,omitempty" yaml:"display_id,omitempty"`
+	TaskID        string            `json:"task_id" yaml:"task_id"`
+	ProjectID     string            `json:"project_id" yaml:"project_id"`
+	TeamID        string            `json:"team_id" yaml:"team_id"`
+	Status        string            `json:"status" yaml:"status"`
+	Branch        string            `json:"branch" yaml:"branch"`
+	Worktree      string            `json:"worktree" yaml:"worktree"`
+	Agent         string            `json:"agent" yaml:"agent"`
+	Step          string            `json:"step" yaml:"step"`
+	Errors        int               `json:"errors" yaml:"errors"`
+	Summary       string            `json:"summary,omitempty" yaml:"summary,omitempty"`
+	StartedAt     string            `json:"started_at" yaml:"started_at"`
+	EndedAt       string            `json:"ended_at,omitempty" yaml:"ended_at,omitempty"`
+	PID           int               `json:"pid,omitempty" yaml:"pid,omitempty"`
+	Metadata      map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	RuntimeConfig config.RuntimeConfig `json:"runtime_config,omitempty" yaml:"runtime_config,omitempty"`
 }
 
 // Event is a single log entry.
@@ -73,7 +75,7 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 
 	user := st.HermesUser
 	if user == "" {
-		user = "cyberkitty"
+		user = config.DefaultHermesUser()
 	}
 
 	runID := "run_" + uuid.New().String()[:8]
@@ -91,6 +93,14 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 			"task_title": t.Title,
 			"team_name":  te.Name,
 		},
+		RuntimeConfig: t.RuntimeConfig,
+	}
+	cfg, _ := config.LoadOrCreate(st.Root)
+	if cfg != nil {
+		did, err := cfg.NextDisplayID("run")
+		if err == nil {
+			r.DisplayID = did
+		}
 	}
 	_ = st.EnsureDir("runs", runID)
 	_ = ensureHermesOwnership(st.Root, user)
@@ -109,17 +119,21 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 			_ = ensureHermesOwnership(wtRoot, user)
 		}
 
-		out, err := runGitAsHermes(st.StubMode, user, p.RepoPath, "worktree", "add", "-b", r.Branch, wtRoot)
+		baseRef := "HEAD"
+		if !st.StubMode {
+			_ = ensureHermesOwnership(p.RepoPath, user)
+		}
+		_ = exec.Command("sudo", "-u", user, "git", "config", "--global", "--add", "safe.directory", p.RepoPath).Run()
+		if p.BaseCommit != "" {
+			baseRef = p.BaseCommit
+		}
+		out, err := runGitAsHermes(st.StubMode, user, p.RepoPath, "worktree", "add", "-b", r.Branch, wtRoot, baseRef)
 		if err != nil {
-			out2, err2 := runGitAsHermes(st.StubMode, user, p.RepoPath, "worktree", "add", wtRoot, r.Branch)
-			if err2 != nil {
-				_ = logEvent(st, r, "system", "error", "git", string(out)+"\n"+string(out2))
-				r.Status = "failed"
-				r.Errors++
-				_ = st.WriteJSON([]string{"runs", runID, "run.json"}, r)
-				return r, fmt.Errorf("git worktree failed: %w\n%s", err, out)
-			}
-			out = out2
+			_ = logEvent(st, r, "system", "error", "git", string(out))
+			r.Status = "failed"
+			r.Errors++
+			_ = st.WriteJSON([]string{"runs", runID, "run.json"}, r)
+			return r, fmt.Errorf("git worktree failed: %w\n%s", err, out)
 		}
 		r.Worktree = wtRoot
 		if !st.StubMode {
@@ -127,7 +141,9 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 		}
 		_ = exec.Command("git", "-C", wtRoot, "config", "user.email", "hw@hermes.local").Run()
 		_ = exec.Command("git", "-C", wtRoot, "config", "user.name", "Hermes Workspace").Run()
-		_ = logEvent(st, r, "system", "tool_call", "git", "worktree add "+wtRoot+" "+r.Branch+"\n"+string(out))
+		_ = exec.Command("sudo", "-u", user, "git", "config", "--global", "--add", "safe.directory", wtRoot).Run()
+		_ = exec.Command("sudo", "-u", user, "git", "config", "--global", "--add", "safe.directory", p.RepoPath).Run()
+		_ = logEvent(st, r, "system", "tool_call", "git", "worktree add "+wtRoot+" "+r.Branch+" from "+baseRef+"\n"+string(out))
 		_ = seedWorktreeDocs(st, r, p, wtRoot)
 	}
 
@@ -163,38 +179,58 @@ func Start(st *store.Store, taskID string) (*Run, error) {
 // seedWorktreeDocs copies project docs (e.g. RESEARCH.md, plan.json) into the run worktree
 // so that every agent can read the shared source of truth regardless of branch.
 func seedWorktreeDocs(st *store.Store, r *Run, p *project.Project, wt string) error {
-	if p.DocsDir == "" || wt == "" {
+	if wt == "" {
 		return nil
 	}
-	return filepath.Walk(p.DocsDir, func(src string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+	var sources []string
+	if p.DocsDir != "" {
+		sources = append(sources, p.DocsDir)
+	}
+	if p.RepoPath != "" {
+		sources = append(sources, p.RepoPath)
+	}
+	for _, srcDir := range sources {
+		if err := filepath.Walk(srcDir, func(src string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return err
+			}
+			rel, err := filepath.Rel(srcDir, src)
+			if err != nil {
+				return err
+			}
+			base := filepath.Base(rel)
+			if base != "RESEARCH.md" && base != "plan.json" && !strings.HasPrefix(rel, "docs") {
+				return nil
+			}
+			dst := filepath.Join(wt, rel)
+			if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+				return err
+			}
+			data, err := os.ReadFile(src)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(dst, data, 0o644); err != nil {
+				return err
+			}
+			_ = logEvent(st, r, "system", "info", "", "seeded doc "+rel)
+			return nil
+		}); err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(p.DocsDir, src)
-		if err != nil {
-			return err
-		}
-		dst := filepath.Join(wt, rel)
-		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			return err
-		}
-		data, err := os.ReadFile(src)
-		if err != nil {
-			return err
-		}
-		if err := os.WriteFile(dst, data, 0o644); err != nil {
-			return err
-		}
-		_ = logEvent(st, r, "system", "info", "", "seeded doc "+rel)
-		return nil
-	})
+	}
+	return nil
 }
 
 // Get loads a run by id.
 func Get(st *store.Store, id string) (*Run, error) {
 	var r Run
 	err := st.ReadJSON([]string{"runs", id, "run.json"}, &r)
-	return &r, err
+	if err != nil {
+		return &r, err
+	}
+	ensureDisplayID(st, &r)
+	return &r, nil
 }
 
 // ListByTask returns all runs for a given task ID.
@@ -210,6 +246,12 @@ func ListByTask(st *store.Store, taskID string) ([]Run, error) {
 		}
 	}
 	return out, nil
+}
+
+func ensureDisplayID(st *store.Store, r *Run) {
+	if r.DisplayID == "" {
+		r.DisplayID = st.DisplayIDFromInternal("run", r.ID)
+	}
 }
 
 // List all runs.
@@ -228,6 +270,7 @@ func List(st *store.Store) ([]Run, error) {
 		}
 		var r Run
 		if err := st.ReadJSON([]string{"runs", e.Name(), "run.json"}, &r); err == nil {
+			ensureDisplayID(st, &r)
 			out = append(out, r)
 		}
 	}
@@ -294,6 +337,19 @@ func Cancel(st *store.Store, id string) error {
 	if r.Status == "done" || r.Status == "failed" || r.Status == "cancelled" {
 		return errors.New("run already finished")
 	}
+	if r.PID > 0 {
+		_ = logEvent(st, r, "system", "info", "", fmt.Sprintf("sending SIGTERM to hermes process group %d", r.PID))
+		// Kill the entire process group so child processes spawned by hermes
+		// are also terminated gracefully.
+		_ = syscall.Kill(-r.PID, syscall.SIGTERM)
+		go func(pid int) {
+			time.Sleep(10 * time.Second)
+			if isProcessAlive(pid) {
+				_ = logEvent(st, r, "system", "warn", "", fmt.Sprintf("hermes process %d still alive after SIGTERM, sending SIGKILL to group", pid))
+				_ = syscall.Kill(-pid, syscall.SIGKILL)
+			}
+		}(r.PID)
+	}
 	r.Status = "cancelled"
 	r.EndedAt = time.Now().UTC().Format(time.RFC3339)
 	_ = logEvent(st, r, "system", "info", "", "run cancelled by user")
@@ -319,7 +375,7 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 
 	user := st.HermesUser
 	if user == "" {
-		user = "cyberkitty"
+		user = config.DefaultHermesUser()
 	}
 
 	r.Agent = agentName
@@ -327,8 +383,25 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 	_ = logEvent(st, r, agentName, "step", "", step)
 	_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
 
-	prompt := buildPrompt(st, r, t, p, te, step, 0, nil)
-	out, err := runHermes(user, profile, prompt, r.Worktree, filepath.Join(st.Root, "runs", r.ID, "activity.log"))
+	prompt := stripNonBmp(buildPrompt(st, r, t, p, te, step, 0, previousRunResponses(st, t)))
+	cfg, _ := config.LoadOrCreate(st.Root)
+	defaults := config.RuntimeConfig{}
+	if cfg != nil {
+		defaults = cfg.RuntimeConfig
+	}
+	rtc := r.RuntimeConfig.Merge(defaults)
+	maxTurns := rtc.MaxTurns
+	if maxTurns <= 0 {
+		maxTurns = 60
+		if t.Type == task.TypeEngineering {
+			maxTurns = 120
+		}
+	}
+	activityPath := filepath.Join(st.Root, "runs", r.ID, "activity.log")
+	out, err := runHermes(user, profile, rtc.Provider, rtc.Model, prompt, r.Worktree, activityPath, maxTurns, func(pid int) {
+		r.PID = pid
+		_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
+	})
 	hermesFailed := err != nil
 	if hermesFailed {
 		r.Errors++
@@ -338,12 +411,21 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 	_ = logEvent(st, r, agentName, "tool_call", "hermes", out)
 	writeRunMetadata(st, r, t, out, hermesFailed)
 
+	// Save the extracted agent response so redo runs can learn from it.
+	// Strip emoji and other supplementary-plane characters that can cause
+	// UTF-8 surrogate encoding errors when the response is fed back into
+	// a hermes chat prompt (Rich console fails on surrogates).
+	agentResponse := stripNonBmp(extractAgentResponse(out))
+	if agentResponse != "" {
+		_ = os.WriteFile(filepath.Join(st.Root, "runs", r.ID, "response.txt"), []byte(agentResponse), 0o644)
+	}
+
 	// Auto-commit any changes the agent produced so downstream worktrees inherit them.
 	if !hermesFailed && p.RepoPath != "" && r.Worktree != "" {
-		_ = exec.Command("git", "-C", r.Worktree, "add", "-A").Run()
-		if _, err := exec.Command("git", "-C", r.Worktree, "diff", "--cached", "--quiet").CombinedOutput(); err != nil {
+		_, _ = runGitAsHermes(st.StubMode, user, r.Worktree, "add", "-A")
+		if _, err := runGitAsHermes(st.StubMode, user, r.Worktree, "diff", "--cached", "--quiet"); err != nil {
 			commitMsg := fmt.Sprintf("agent: %s %s\n\n%s", t.Type, t.ID, t.Title)
-			if out, cerr := exec.Command("git", "-C", r.Worktree, "commit", "-m", commitMsg).CombinedOutput(); cerr != nil {
+			if out, cerr := runGitAsHermes(st.StubMode, user, r.Worktree, "commit", "-m", commitMsg); cerr != nil {
 				_ = logEvent(st, r, "system", "error", "git", "commit failed: "+cerr.Error()+"\n"+string(out))
 			} else {
 				_ = logEvent(st, r, "system", "info", "git", "committed agent changes")
@@ -426,8 +508,32 @@ func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 	reason := "stub approved"
 
 	switch t.Type {
+	case task.TypeResearch:
+		// Write a minimal but valid RESEARCH.md so gate checks pass in stub mode.
+		if r.Worktree != "" {
+			wtPath := filepath.Join(r.Worktree, "RESEARCH.md")
+			_ = os.WriteFile(wtPath, []byte(`# RESEARCH.md
+
+## Stack
+- Language: Go
+- Framework: standard library
+
+## Architecture
+- Directory layout: cmd/main entrypoint, internal packages
+- Key files: main.go, go.mod
+
+## Acceptance Criteria
+- Greet returns expected string.
+- Tests pass.
+
+## Engineering Notes
+- Keep changes minimal and focused.
+`), 0o644)
+			// Register the doc with the project so downstream agents/gates can read it.
+			_ = project.AddDoc(st, p.ID, wtPath)
+		}
 	case task.TypeQAVerify:
-		// First QA verification attempt is rejected to exercise the redo path.
+		// First QA verification attempt is rejected to exercise the engineering redo path.
 		if t.RedoIndex == 0 {
 			verdict = "reject"
 			reason = "stub: first QA verification rejected to test redo"
@@ -435,19 +541,21 @@ func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 				"verdict": "reject",
 				"reason":  reason,
 			})
-		} else {
-			// Write a fake diff and review note so gate checks pass.
-			if r.Worktree != "" {
-				_ = writeStubDiff(r.Worktree, "qa-verify")
-			}
-			_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, map[string]string{
-				"verdict":        "approve",
-				"reason":         "stub QA verify passed",
-				"qa_review_note": "- checked diff exists\n- checked unit tests\n- checked lint clean",
-			})
+			break
 		}
+		// Write a fake diff and review note so gate checks pass.
+		if r.Worktree != "" {
+			_ = writeStubDiff(r.Worktree, "qa-verify")
+		}
+		_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, map[string]string{
+			"verdict":        "approve",
+			"reason":         "stub QA verify passed",
+			"qa_review_note": "- checked diff exists\n- checked unit tests\n- checked lint clean",
+		})
 	case task.TypePMPlan:
 		// Generate a multi-task engineering plan with dependencies to test DAG expansion.
+		planDir := filepath.Join(r.Worktree, "docs")
+		_ = os.MkdirAll(planDir, 0o755)
 		plan := stubPlan{
 			Tasks: []stubPlanTask{
 				{ID: "eng-core", Type: "engineering", Specialization: "backend", Title: "Implement core logic", Dependencies: []string{}},
@@ -459,11 +567,58 @@ func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 		inner, _ := json.Marshal(plan) // {"tasks":[...]}
 		wrapper := map[string]json.RawMessage{"plan": inner}
 		planJSON, _ := json.Marshal(wrapper) // {"plan":{"tasks":[...]}}
+		planFile := filepath.Join(planDir, "plan.json")
+		_ = os.WriteFile(planFile, planJSON, 0o644)
+		_ = project.AddDoc(st, p.ID, planFile)
 		_ = st.WriteJSON([]string{"runs", r.ID, "metadata.json"}, map[string]string{
 			"verdict": "approve",
 			"reason":  "stub PM plan generated",
 			"plan":    string(planJSON),
 		})
+	case task.TypeEngineering:
+		// Regular engineering tasks always approve in stub mode.
+		// (Redos created after a QA reject also approve so the workflow can finish.)
+		// Ensure the stub engineering run produces a compilable cmd entrypoint so gate checks pass.
+		if r.Worktree != "" {
+			cmdDir := filepath.Join(r.Worktree, "cmd", p.ID)
+			_ = os.MkdirAll(cmdDir, 0o755)
+			mainPath := filepath.Join(cmdDir, "main.go")
+			_ = os.WriteFile(mainPath, []byte(`package main
+
+import "fmt"
+
+func Greet(name string) string {
+	return fmt.Sprintf("Hello, %s!", name)
+}
+
+func main() {
+	fmt.Println(Greet("world"))
+}
+`), 0o644)
+			// Replace the placeholder root main.go (if any) with a compilable version
+			// so that `go build ./...` does not fail on an empty package main.
+			rootMain := filepath.Join(r.Worktree, "main.go")
+			if info, err := os.Stat(rootMain); err == nil && info.Size() < 50 {
+				_ = os.WriteFile(rootMain, []byte(`package main
+
+func main() {}
+`), 0o644)
+			}
+			testPath := filepath.Join(cmdDir, "main_test.go")
+			_ = os.WriteFile(testPath, []byte(`package main
+
+import "testing"
+
+func TestGreet(t *testing.T) {
+	if got := Greet("world"); got != "Hello, world!" {
+		t.Fatalf("unexpected greeting: %s", got)
+	}
+}
+`), 0o644)
+			// Stage and commit changes so they can be merged back to the project repo.
+			_, _ = runGitAsHermes(true, "", r.Worktree, "add", ".")
+			_, _ = runGitAsHermes(true, "", r.Worktree, "commit", "-m", "stub: engineering "+t.ID)
+		}
 	default:
 		writeRunMetadata(st, r, t, "", false)
 	}
@@ -493,7 +648,7 @@ func executeStub(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 
 // isProcessAlive checks whether a PID is still running on Linux.
 func isProcessAlive(pid int) bool {
-	return unix.Kill(pid, 0) == nil
+	return syscall.Kill(pid, 0) == nil
 }
 
 // acquireSlot claims one of N filesystem slots; returns the slot number (1..N).
@@ -557,27 +712,75 @@ func (a *activityWriter) write(format string, args ...interface{}) {
 	fmt.Fprintf(f, "[%s] "+format+"\n", append([]interface{}{time.Now().UTC().Format(time.RFC3339)}, args...)...)
 }
 
-func runHermes(user, profile, prompt, worktree, activityPath string) (string, error) {
+func runHermes(user, profile, provider, model, prompt, worktree, activityPath string, maxTurns int, setPID func(int)) (string, error) {
+	if maxTurns <= 0 {
+		maxTurns = 60
+	}
 	act := &activityWriter{path: activityPath}
-	act.write("start profile=%s worktree=%s", profile, worktree)
+	act.write("start profile=%s provider=%s model=%s worktree=%s", profile, provider, model, worktree)
 
 	args := []string{
 		"--profile", profile,
 		"chat", "-q", prompt,
-		"--toolsets", "file,terminal",
-		"--yolo",
 	}
+	if provider != "" {
+		args = append(args, "--provider", provider)
+	}
+	if model != "" {
+		args = append(args, "--model", model)
+	}
+
 	hermesBin := "/home/" + user + "/.local/bin/hermes"
 	if _, err := os.Stat(hermesBin); err != nil {
 		hermesBin = "hermes"
 	}
-	baseArgs := append([]string{"-u", user, hermesBin}, args...)
-	cmd := exec.Command("sudo", baseArgs...)
+
+	// Check if we're already running as the target user — if so, skip sudo
+	// entirely. This avoids sudo's env_reset which strips LANG/PYTHONIOENCODING
+	// and causes UTF-8 surrogate encoding errors with Cyrillic prompts.
+	currentUser := os.Getenv("USER")
+	if currentUser == "" {
+		currentUser = filepath.Base(os.Getenv("HOME"))
+	}
+
+	fullArgs := append(args, "--toolsets", "file,terminal", "--yolo", "--source", "tool",
+		"--max-turns", fmt.Sprintf("%d", maxTurns))
+
+	// Build env with UTF-8 overrides (filter old values first).
+	envBase := os.Environ()
+	filtered := make([]string, 0, len(envBase)+5)
+	for _, e := range envBase {
+		if strings.HasPrefix(e, "LANG=") || strings.HasPrefix(e, "LC_") || strings.HasPrefix(e, "PYTHONIOENCODING=") || strings.HasPrefix(e, "PYTHONUTF8=") {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	cleanEnv := append(filtered,
+		"HOME=/home/"+user,
+		"PYTHONIOENCODING=utf-8",
+		"PYTHONUTF8=1",
+		"LANG=en_US.UTF-8",
+		"LC_ALL=en_US.UTF-8",
+	)
+
+	var cmd *exec.Cmd
+	if currentUser == user {
+		// Running as the same user — no sudo needed, env is set directly.
+		cmd = exec.Command(hermesBin, fullArgs...)
+		cmd.Env = cleanEnv
+	} else {
+		// Running as root/other — use sudo with env wrapper to survive env_reset.
+		envPrefix := []string{"env", "PYTHONIOENCODING=utf-8", "PYTHONUTF8=1", "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8"}
+		sudoArgs := append([]string{"-u", user}, envPrefix...)
+		sudoArgs = append(sudoArgs, hermesBin)
+		sudoArgs = append(sudoArgs, fullArgs...)
+		cmd = exec.Command("sudo", sudoArgs...)
+		cmd.Env = cleanEnv
+	}
 	if worktree != "" {
 		cmd.Dir = worktree
 	}
-	// Preserve PATH and other env needed by Hermes when running under sudo.
-	cmd.Env = append(os.Environ(), "HOME=/home/"+user)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -589,6 +792,9 @@ func runHermes(user, profile, prompt, worktree, activityPath string) (string, er
 	}
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("start hermes: %w", err)
+	}
+	if setPID != nil && cmd.Process != nil {
+		setPID(cmd.Process.Pid)
 	}
 
 	var wg sync.WaitGroup
@@ -603,7 +809,8 @@ func runHermes(user, profile, prompt, worktree, activityPath string) (string, er
 			outBuf.WriteString(line)
 			outBuf.WriteByte('\n')
 			outMu.Unlock()
-			act.write("line")
+			act.write("%s", line)
+			_ = appendAgentLog(activityPath, line)
 		}
 	}
 	wg.Add(2)
@@ -614,7 +821,9 @@ func runHermes(user, profile, prompt, worktree, activityPath string) (string, er
 	// Hermes tool calls already have their own timeouts; this catches a truly stuck
 	// process rather than imposing a wall-clock limit on the whole run.
 	done := make(chan struct{})
-	go monitorHermesActivity(cmd, activityPath, 3*time.Minute, done)
+	logPath := filepath.Join(filepath.Dir(activityPath), "agent.log")
+	go monitorHermesActivity(cmd, logPath, 3*time.Minute, done)
+	go monitorToolLimitReached(cmd, logPath, done)
 
 	err = cmd.Wait()
 	close(done)
@@ -626,9 +835,23 @@ func runHermes(user, profile, prompt, worktree, activityPath string) (string, er
 	return cleanHermesOutput(outBuf.String()), nil
 }
 
-// monitorHermesActivity polls the activity log mtime. If it has not changed for
-// longer than staleThreshold and the process is still running, it kills the process.
-func monitorHermesActivity(cmd *exec.Cmd, activityPath string, staleThreshold time.Duration, done <-chan struct{}) {
+// appendAgentLog writes a timestamped line to the run agent log.
+func appendAgentLog(activityPath, line string) error {
+	logPath := filepath.Join(filepath.Dir(activityPath), "agent.log")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = fmt.Fprintf(f, "[%s] %s\n", time.Now().UTC().Format(time.RFC3339), line)
+	return err
+}
+
+// monitorHermesActivity polls the agent log mtime. If it has not changed for
+// longer than staleThreshold and the process is still running, it kills the
+// whole process group. This catches a stuck agent without imposing a wall-clock
+// limit on legitimate long runs.
+func monitorHermesActivity(cmd *exec.Cmd, logPath string, staleThreshold time.Duration, done <-chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	lastMtime := time.Now()
@@ -637,13 +860,51 @@ func monitorHermesActivity(cmd *exec.Cmd, activityPath string, staleThreshold ti
 		case <-done:
 			return
 		case <-ticker.C:
-			info, err := os.Stat(activityPath)
+			info, err := os.Stat(logPath)
 			if err == nil && info.ModTime().After(lastMtime) {
 				lastMtime = info.ModTime()
 			}
 			if time.Since(lastMtime) > staleThreshold {
 				if cmd.Process != nil {
-					_ = cmd.Process.Kill()
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				}
+				return
+			}
+		}
+	}
+}
+
+// monitorToolLimitReached watches the agent log for signs that hermes hit its
+// tool-use/max-turns ceiling but failed to exit. If the process is still alive
+// 30 seconds after such a message, the whole process group is killed.
+func monitorToolLimitReached(cmd *exec.Cmd, logPath string, done <-chan struct{}) {
+	limitPhrases := []string{
+		"maximum tool calls exceeded",
+		"max turns reached",
+		"tool use limit reached",
+		"turn limit reached",
+	}
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	var limitSeen time.Time
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			data, err := os.ReadFile(logPath)
+			if err == nil {
+				text := strings.ToLower(string(data))
+				for _, phrase := range limitPhrases {
+					if strings.Contains(text, phrase) && limitSeen.IsZero() {
+						limitSeen = time.Now()
+						break
+					}
+				}
+			}
+			if !limitSeen.IsZero() && time.Since(limitSeen) > 30*time.Second {
+				if cmd.Process != nil {
+					_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 				}
 				return
 			}
@@ -662,7 +923,9 @@ func cleanHermesOutput(s string) string {
 	lines := strings.Split(s, "\n")
 	var out []string
 	for _, line := range lines {
-		if strings.Contains(line, "preparing") || strings.Contains(line, "┊") {
+		// Strip Hermes progress-animation lines and the final session summary, but keep
+		// model reasoning/thinking lines and other content.
+		if strings.Contains(line, "preparing") {
 			continue
 		}
 		if strings.HasPrefix(line, "Resume this session") ||
@@ -674,6 +937,48 @@ func cleanHermesOutput(s string) string {
 		out = append(out, line)
 	}
 	return strings.Join(out, "\n")
+}
+
+// previousRunResponses finds agent responses from previous runs in the same task group.
+// This allows redo iterations to learn from prior attempts instead of starting from scratch.
+func previousRunResponses(st *store.Store, t *task.Task) []string {
+	if t.Group == "" {
+		return nil
+	}
+	// Find all tasks in the same group with lower redo_index.
+	allTasks, err := task.List(st)
+	if err != nil {
+		return nil
+	}
+	var prevTaskIDs []string
+	for _, tt := range allTasks {
+		if tt.Group == t.Group && tt.RedoIndex < t.RedoIndex && tt.ID != t.ID {
+			prevTaskIDs = append(prevTaskIDs, tt.ID)
+		}
+	}
+	// For each previous task, find its run and read response.txt.
+	var responses []string
+	for _, tid := range prevTaskIDs {
+		runs, err := ListByTask(st, tid)
+		if err != nil {
+			continue
+		}
+		for _, r := range runs {
+			if r.Status != "done" {
+				continue
+			}
+			respPath := filepath.Join(st.Root, "runs", r.ID, "response.txt")
+			data, err := os.ReadFile(respPath)
+			if err != nil {
+				continue
+			}
+			text := strings.TrimSpace(stripNonBmp(string(data)))
+			if len(text) > 0 {
+				responses = append(responses, text)
+			}
+		}
+	}
+	return responses
 }
 
 func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team.Team, step string, stepIdx int, previous []string) string {
@@ -719,7 +1024,10 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 		b.WriteString("\nAs the researcher, study the task and environment, then write a RESEARCH.md file in the working directory. " +
 			"It must contain these exact sections with concrete decisions (not placeholders):\n" +
 			"# RESEARCH.md\n\n## Stack\n- Programming language and framework(s)\n- Frontend approach (e.g. htmx CDN + Go html/template)\n- Build/test commands to use\n\n## Architecture\n- Directory layout\n- Key files/components\n\n## Acceptance Criteria\n- Specific behaviors the implementation must satisfy\n\n## Engineering Notes\n- Constraints the coder/engineer must follow\n\n" +
-			"Do not write code. Only write RESEARCH.md. The next QA reviewer will verify this document, and the PM/engineer will use it as the source of truth.\n")
+			"Do not write code. Only write RESEARCH.md. Before claiming the file is written, verify it exists with `ls RESEARCH.md`. The next QA reviewer will verify this document, and the PM/engineer will use it as the source of truth.\n\n" +
+			"CRITICAL: Never give up at the first obstacle. If a site requires auth — register (free if possible). If an API returns 302 — inspect cookies, try session auth. If data is hidden — open DevTools, intercept AJAX responses, check network traffic. If one approach fails — try at least 3 different approaches before declaring something inaccessible. " +
+			"Document every approach you tried in RESEARCH.md, including failures. Do NOT invent placeholder values when real data can be extracted. " +
+			"Acceptance criteria MUST reflect the actual task requirements, not a weakened version that is easier to satisfy.\n")
 	}
 	if t.Type == task.TypePMPlan {
 		b.WriteString("\nAs the PM planner, produce a detailed implementation plan. " +
@@ -727,51 +1035,69 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 			"The JSON must be under the key 'plan' with an array of engineering tasks. " +
 			"Each task: id, type='engineering', specialization, title, optional description, dependencies (array of ids). " +
 			"The JSON must be compact (single line), with no literal newlines inside string values — use \\n escapes if needed. " +
+			"CRITICAL: every engineering task must be TINY. A task is too big if it requires more than one of: a single endpoint, a single HTML template, a single handler function, or a single test file. " +
+			"Break every feature into the smallest possible sub-tasks. For example, separate 'create API endpoint', 'list API endpoint', 'HTML list template', 'HTML form template', and 'handler wiring' into distinct tasks. " +
+			"Prefer tasks that can be completed in under 15 tool-calling iterations. " +
+			"Use specializations: backend for JSON API handlers, template for HTML/template files, tests for test files, css for styles, cli for wiring/flags. " +
 			"After writing the file, report a concise summary of what you did.\n\n" +
 			"Example contents of docs/plan.json:\n" +
 			"{\"plan\":{\"tasks\":[{\"id\":\"eng-core\",\"type\":\"engineering\",\"specialization\":\"backend\",\"title\":\"Implement core\",\"dependencies\":[]}]}}\n")
 	}
 	if t.VerdictReason != "" {
 		b.WriteString(fmt.Sprintf("Rejection reason to address: %s\n", t.VerdictReason))
+		b.WriteString("You are continuing this task after a previous rejection. Review the previous attempt's worktree if available and address the stated reason before giving your verdict.\n")
 	}
 	if r.Worktree != "" {
 		b.WriteString(fmt.Sprintf("Working directory (git worktree): %s\n", r.Worktree))
+		if p.BaseCommit != "" {
+			b.WriteString(fmt.Sprintf("Base commit for this worktree: %s\n", p.BaseCommit))
+		}
 		b.WriteString("You may read files and run git commands here. Prefer small, focused changes.\n")
 		switch t.Type {
 		case task.TypeQAReview:
-			b.WriteString("\nMANDATORY: before giving your verdict, read RESEARCH.md in this worktree. " +
+			b.WriteString("\nMANDATORY: verify paths and files exist before referring to them. Use `ls`, `find`, or `git status` to confirm actual locations. Before giving your verdict, read RESEARCH.md in this worktree. " +
 				"Verify that it contains concrete Stack, Architecture, Acceptance Criteria and Engineering Notes sections. " +
 				"If the research document is missing or unclear, reject the task in your summary. " +
-				"docs/plan.json is NOT required for this review step.\n")
+				"docs/plan.json is NOT required for this review step.\n\n" +
+				"CRITICAL: Do NOT just read the document and approve. Independently verify the researcher's claims. " +
+				"If the researcher claims data is inaccessible — try to access it yourself (open the site, register, check DevTools). " +
+				"If the researcher weakened acceptance criteria (e.g. 'prices may differ' when the task says 'formulas must match') — reject. " +
+				"Minimum: open any external source referenced in the task and verify at least one claim independently.\n")
 		case task.TypeQAVerify:
-			b.WriteString("\nMANDATORY: verify the implementation against RESEARCH.md acceptance criteria. " +
+			b.WriteString("\nMANDATORY: verify paths and files exist before referring to them. Verify the implementation against RESEARCH.md acceptance criteria. " +
 				"Run the project test command and lint command if available. " +
-				"If tests fail or acceptance criteria are not met, reject the task in your summary.\n")
+				"If tests fail or acceptance criteria are not met, reject the task in your summary.\n\n" +
+				"CRITICAL: Do NOT just check that tests pass and files exist. Compare the actual output against the ORIGINAL source referenced in the task. " +
+				"If the task says 'formulas must match' — verify numerical equivalence with the original, not just structural similarity. " +
+				"If the task references an external site/API — open it and compare results for at least 2 test cases. " +
+				"If RESEARCH.md contains weakened criteria (e.g. 'prices may differ' when task says 'must match') — treat this as a defect and reject.\n")
 		default:
-			b.WriteString("\nMANDATORY: before writing code, read RESEARCH.md and docs/plan.json in this worktree. " +
-				"Follow the stack, architecture and acceptance criteria from RESEARCH.md exactly. " +
-				"If either file is missing or the stack is unclear, reject the task in your summary.\n")
+			b.WriteString("\nRead RESEARCH.md and docs/plan.json in this worktree if they exist; use them as guidance. " +
+				"Follow the stack, architecture and acceptance criteria from RESEARCH.md when available. " +
+				"If these files are missing, proceed using the task description and produce a small, correct implementation. Do not reject solely because documentation is missing.\n")
 		}
 	}
 	if len(previous) > 0 {
-		b.WriteString("\nPrevious steps (last 2 summaries):\n")
+		b.WriteString("\nPREVIOUS ATTEMPT FEEDBACK — learn from prior iterations, do NOT repeat the same mistakes:\n")
 		start := 0
-		if len(previous) > 2 {
-			start = len(previous) - 2
+		if len(previous) > 3 {
+			start = len(previous) - 3
 		}
 		for i := start; i < len(previous); i++ {
-			b.WriteString(truncate(previous[i], 800))
+			b.WriteString(truncate(previous[i], 4000))
 			b.WriteString("\n---\n")
 		}
+		b.WriteString("Use the above to avoid repeating failed approaches. If a previous attempt discovered something useful (e.g. an API endpoint, a data format, a working method), build on that knowledge instead of starting from scratch.\n")
 	}
 	b.WriteString(fmt.Sprintf("\nPerform the '%s' step and report a concise summary of what you did.", step))
-	if t.Type == task.TypeQAReview || t.Type == task.TypeQAVerify || t.Type == task.TypePMConsistency {
-		b.WriteString("\n\nAt the very end of your response, on its own line, you MUST output exactly one of:\n")
-		b.WriteString("verdict: approve\n")
-		b.WriteString("or\n")
-		b.WriteString("verdict: reject\n")
-		b.WriteString("Nothing else may follow the verdict line.\n")
-	}
+	b.WriteString("\n\nIMPORTANT: throughout your response, include a brief reasoning block before every significant decision or tool call. " +
+		"Wrap each reasoning in XML-like tags: <reasoning>your short reasoning here</reasoning>. " +
+		"These reasoning blocks will be captured in the run log for transparency. Keep reasoning concise (1-2 sentences).")
+	b.WriteString("\n\nAt the very end of your response, on its own line, you MUST output exactly one of:\n")
+	b.WriteString("verdict: approve\n")
+	b.WriteString("or\n")
+	b.WriteString("verdict: reject\n")
+	b.WriteString("Nothing else may follow the verdict line.\n")
 	return b.String()
 }
 
@@ -832,6 +1158,21 @@ func writeStubDiff(worktree, marker string) error {
 	_ = exec.Command("git", "-C", worktree, "add", "stub-output.md").Run()
 	// Leave the change staged but not committed so git diff HEAD is non-empty.
 	return nil
+}
+
+// stripNonBmp removes characters outside the Unicode Basic Multilingual Plane
+// (U+10000 and above, including emoji) that can cause surrogate encoding errors
+// when the text is passed through Python's Rich console or other UTF-8 streams
+// that reject surrogates.
+func stripNonBmp(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r > 0xFFFF {
+			continue // skip supplementary plane (emoji, etc.)
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // extractAgentResponse strips the hermes CLI framing (query, banners, resume hints)
@@ -916,11 +1257,11 @@ func writeRunMetadata(st *store.Store, r *Run, t *task.Task, agentOutput string,
 	} else if approved {
 		meta["verdict"] = "approve"
 	}
-	// Last-5-lines sanity check: if final lines say the task is not done, reject.
+	// Last-5-lines sanity check: only explicit failure markers trigger reject.
 	lines := strings.Split(agentOutput, "\n")
 	for i := len(lines) - 1; i >= 0 && i >= len(lines)-5; i-- {
 		line := strings.ToLower(strings.TrimSpace(lines[i]))
-		if strings.Contains(line, "not ready") || strings.Contains(line, "not implemented") || strings.Contains(line, "incomplete") {
+		if strings.Contains(line, "verdict: reject") || strings.Contains(line, "task failed") || strings.Contains(line, "build failed") || strings.Contains(line, "tests failed") {
 			meta["verdict"] = "reject"
 		}
 	}

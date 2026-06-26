@@ -8,16 +8,19 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"control-room/internal/config"
 	"control-room/internal/epic"
 	"control-room/internal/gate"
 	"control-room/internal/project"
 	"control-room/internal/run"
 	"control-room/internal/store"
 	"control-room/internal/task"
+	"control-room/internal/team"
 )
 
 // Orchestrator drives a deterministic workflow state machine for an Epic.
@@ -58,209 +61,36 @@ var transitions = map[task.TaskType]map[string]task.TaskType{
 
 // RunEpic expands an Epic into workflow tasks and drives them to completion.
 func (o *Orchestrator) RunEpic(epicID string, cb func(string, ...interface{})) error {
-	e, err := epic.Get(o.Store, epicID)
-	if err != nil {
-		return err
-	}
-	if e.Status == "done" {
-		return errors.New("epic already done")
-	}
-	e.Status = "in_progress"
-	_ = epic.Update(o.Store, e)
-
-	proj, err := project.Get(o.Store, e.ProjectID)
-	if err != nil {
-		return err
-	}
-	if proj.DefaultTeam == "" {
-		return errors.New("project has no default team for workflow tasks")
-	}
-
-	// Create initial research task if none exists.
-	children, err := task.ListByEpic(o.Store, epicID)
-	if err != nil {
-		return err
-	}
-	var researchTask *task.Task
-	for _, c := range children {
-		if c.Type == task.TypeResearch {
-			researchTask = &c
-			break
-		}
-	}
-	if researchTask == nil {
-		researchTask, err = task.Create(o.Store, &task.Task{
-			Title:       "Research: " + e.Title,
-			Description: e.Description,
-			Type:        task.TypeResearch,
-			ProjectID:   e.ProjectID,
-			EpicID:      e.ID,
-			TeamID:      proj.DefaultTeam,
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	for {
-		// 1. Pick a ready open task in this epic.
-		ready, err := o.nextReadyTask(epicID)
-		if err != nil {
-			return err
-		}
-		if ready == nil {
-			// Nothing open. Check if everything is done/approved.
-			if o.epicFinished(epicID) {
-				e.Status = "done"
-				_ = epic.Update(o.Store, e)
-				cb("epic_done", e.ID)
-				return nil
-			}
-			// Deadlock or all remaining tasks pending review.
-			cb("waiting_for_review", epicID)
-			return errors.New("no ready tasks: remaining tasks are pending review or blocked")
-		}
-
-		cb("task_start", ready.ID, ready.Type)
-
-		// 2. Run the task.
-		r, err := run.Start(o.Store, ready.ID)
-		if err != nil {
-			return fmt.Errorf("failed to start run for task %s: %w", ready.ID, err)
-		}
-
-		// Wait for the run to finish. We tail events synchronously.
-		var lastEvents []run.Event
-		waitErr := run.WaitFor(o.Store, r.ID, func(ev run.Event) {
-			lastEvents = append(lastEvents, ev)
-			cb("event", ev)
-		})
-		if waitErr != nil {
-			cb("wait_error", waitErr)
-		}
-
-		// 3. Read verdict from run metadata.
-		verdict, reason, verdictErr := o.readVerdict(r.ID)
-		if verdictErr != nil {
-			cb("verdict_error", ready.ID, verdictErr)
-			// Treat missing/invalid verdict as reject.
-			verdict = "reject"
-			reason = "no valid verdict in run metadata: " + verdictErr.Error()
-		}
-
-		// 3.5 Human-in-the-loop override for QA verify.
-		if o.ManualApprove && ready.Type == task.TypeQAVerify && verdict == "approve" {
-			if o.Prompt != nil {
-				cb("awaiting_manual_approval", ready.ID)
-				verdict, reason = o.Prompt(ready.ID)
-				cb("manual_verdict", ready.ID, verdict, reason)
-			}
-		}
-
-		ready.Status = task.StatusPendingReview
-		ready.Verdict = verdict
-		ready.VerdictReason = reason
-		_ = task.Update(o.Store, ready)
-
-		cb("task_verdict", ready.ID, verdict, reason)
-
-		// 4. Hard gate checks override an LLM approve.
-		if verdict == "approve" {
-			proj, _ := project.Get(o.Store, e.ProjectID)
-			g, err := gate.Run(o.Store, ready, r, proj)
-			if err != nil {
-				cb("gate_error", ready.ID, err)
-				verdict = "reject"
-				reason = "gate check error: " + err.Error()
-			} else if !g.Passed {
-				cb("gate_failed", ready.ID, g.Errors)
-				verdict = "reject"
-				reason = "gate checks failed: " + strings.Join(g.Errors, "; ")
-			}
-		}
-
-		// 5. Apply deterministic transition.
-		// 5. Apply deterministic transition.
-		if verdict == "approve" {
-			ready.Status = task.StatusApproved
-			ready.EndedAt = time.Now().UTC().Format(time.RFC3339)
-			_ = task.Update(o.Store, ready)
-
-			if ready.Type == task.TypePMConsistency {
-				e.Status = "done"
-				_ = epic.Update(o.Store, e)
-				cb("epic_done", e.ID)
-				return nil
-			}
-
-			nextType := transitions[ready.Type]["approved"]
-			if ready.Type == task.TypeResearch {
-				if err := o.copyResearchDoc(ready); err != nil {
-					cb("research_doc_error", ready.ID, err)
-				}
-			}
-			if ready.Type == task.TypePMPlan {
-				if err := o.copyPlanDoc(ready); err != nil {
-					cb("plan_doc_error", ready.ID, err)
-				}
-			}
-			if ready.Type == task.TypeEngineering {
-				if err := o.mergeEngineeringWorktree(ready); err != nil {
-					cb("merge_error", ready.ID, err)
-				}
-			}
-
-			if nextType == "" || nextType == task.TypeQAVerify {
-				// Engineering approved: the orchestrator already created a single QA verify
-				// task that depends on all engineering tasks. No new task is created here.
-				cb("task_done", ready.ID)
-				continue
-			}
-			if nextType == task.TypeEngineering {
-				// PM plan expands to engineering tasks.
-				if err := o.expandEngineering(ready); err != nil {
-					return err
-				}
-			} else {
-				if _, err := task.Create(o.Store, &task.Task{
-					Title:       o.nextTitle(nextType, ready),
-					Type:        nextType,
-					ProjectID:   e.ProjectID,
-					EpicID:      e.ID,
-					ParentID:    ready.ID,
-					TeamID:      proj.DefaultTeam,
-					Description: ready.Description,
-				}); err != nil {
-					return err
-				}
-			}
-		} else {
-			// reject
-			ready.Status = task.StatusRejected
-			_ = task.Update(o.Store, ready)
-
-			redoType := transitions[ready.Type]["rejected"]
-			if redoType == "" {
-				redoType = ready.Type
-			}
-			redo, err := task.Redo(o.Store, ready, reason)
-			if err != nil {
-				return err
-			}
-			redo.Type = redoType
-			_ = task.Update(o.Store, redo)
-			cb("redo_created", redo.ID, redoType, reason)
-		}
-	}
+	return o.runEpicLoop(epicID, false, cb)
 }
 
 // WatchEpic runs a detached-style orchestration loop. It starts every ready task
 // in parallel, waits for all of them, then applies transitions and repeats.
 func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{})) error {
-	e, err := epic.Get(o.Store, epicID)
+	// Acquire watch lock to prevent duplicate watch processes on the same epic.
+	lockPath := filepath.Join(o.Store.Root, ".watch-lock", epicID+".lock")
+	if isLocked(lockPath) {
+		return fmt.Errorf("epic %s is already being watched (lock held by another process)", epicID)
+	}
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return fmt.Errorf("create watch-lock dir: %w", err)
+	}
+	if err := os.WriteFile(lockPath, []byte(fmt.Sprintf("%d", os.Getpid())), 0o644); err != nil {
+		return fmt.Errorf("write watch-lock: %w", err)
+	}
+	defer o.cleanupWatchLock(epicID)
+	return o.runEpicLoop(epicID, true, cb)
+}
+
+// runEpicLoop is the shared orchestration engine for both RunEpic (sequential)
+// and WatchEpic (parallel batch) modes.
+func (o *Orchestrator) runEpicLoop(epicID string, parallel bool, cb func(string, ...interface{})) error {
+	resolved, err := epic.Resolve(o.Store, epicID)
 	if err != nil {
 		return err
 	}
+	epicID = resolved.ID
+	e := resolved
 	if e.Status == "done" {
 		return errors.New("epic already done")
 	}
@@ -275,44 +105,38 @@ func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{}))
 		return errors.New("project has no default team for workflow tasks")
 	}
 
-	children, err := task.ListByEpic(o.Store, epicID)
-	if err != nil {
+	if _, err := o.ensureResearchTask(e, proj); err != nil {
 		return err
-	}
-	var researchTask *task.Task
-	for _, c := range children {
-		if c.Type == task.TypeResearch {
-			researchTask = &c
-			break
-		}
-	}
-	if researchTask == nil {
-		researchTask, err = task.Create(o.Store, &task.Task{
-			Title:       "Research: " + e.Title,
-			Description: e.Description,
-			Type:        task.TypeResearch,
-			ProjectID:   e.ProjectID,
-			EpicID:      e.ID,
-			TeamID:      proj.DefaultTeam,
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	type taskResult struct {
-		t       *task.Task
-		r       *run.Run
-		verdict string
-		reason  string
 	}
 
 	for {
-		ready, err := o.nextReadyTasks(epicID)
+		// First, resolve any pending_review tasks that already have a valid verdict.
+		// This prevents tasks from getting stuck between "agent finished" and
+		// "resolution applied" when the orchestration loop restarts.
+		pending, err := o.nextPendingReviewTasks(epicID)
 		if err != nil {
 			return err
 		}
-		if len(ready) == 0 {
+		for _, t := range pending {
+			if err := o.applyTaskResolution(&t, t.Verdict, t.VerdictReason, e, proj, cb); err != nil {
+				return err
+			}
+		}
+
+		var ready []task.Task
+		if parallel {
+			ready, err = o.nextReadyTasks(epicID)
+		} else {
+			var single *task.Task
+			single, err = o.nextReadyTask(epicID)
+			if single != nil {
+				ready = []task.Task{*single}
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if len(ready) == 0 && len(pending) == 0 {
 			if o.epicFinished(epicID) {
 				e.Status = "done"
 				_ = epic.Update(o.Store, e)
@@ -320,148 +144,356 @@ func (o *Orchestrator) WatchEpic(epicID string, cb func(string, ...interface{}))
 				return nil
 			}
 			cb("waiting_for_review", epicID)
+			if parallel {
+				// Watch mode: absence of ready tasks is normal when the epic is blocked
+				// waiting for review or external input. Return cleanly so the cronjob
+				// does not spam error alerts.
+				return nil
+			}
 			return errors.New("no ready tasks: remaining tasks are pending review or blocked")
 		}
 
-		cb("batch_ready", len(ready))
+		if parallel {
+			cb("batch_ready", len(ready))
+		}
 		for _, t := range ready {
 			cb("task_start", t.ID, t.Type)
 		}
 
-		var wg sync.WaitGroup
-		mu := sync.Mutex{}
-		results := make(map[string]*taskResult, len(ready))
-		for i := range ready {
-			t := &ready[i]
+		if parallel {
+			var wg sync.WaitGroup
+			mu := sync.Mutex{}
+			results := make([]struct {
+				t       *task.Task
+				r       *run.Run
+				verdict string
+				reason  string
+				err     error
+			}, len(ready))
+			for i := range ready {
+				t := &ready[i]
+				r, err := run.Start(o.Store, t.ID)
+				if err != nil {
+					return fmt.Errorf("failed to start run for task %s: %w", t.ID, err)
+				}
+				wg.Add(1)
+				go func(idx int, t *task.Task, r *run.Run) {
+					defer wg.Done()
+					verdict, reason, err := o.runTaskToVerdict(t, r, cb)
+					mu.Lock()
+					results[idx] = struct {
+						t       *task.Task
+						r       *run.Run
+						verdict string
+						reason  string
+						err     error
+					}{t, r, verdict, reason, err}
+					mu.Unlock()
+				}(i, t, r)
+			}
+			wg.Wait()
+			for _, res := range results {
+				if res.err != nil {
+					return res.err
+				}
+				if err := o.applyTaskResolution(res.t, res.verdict, res.reason, e, proj, cb); err != nil {
+					return err
+				}
+			}
+		} else {
+			t := &ready[0]
 			r, err := run.Start(o.Store, t.ID)
 			if err != nil {
 				return fmt.Errorf("failed to start run for task %s: %w", t.ID, err)
 			}
-			wg.Add(1)
-			go func(t *task.Task, r *run.Run) {
-				defer wg.Done()
-				_ = run.WaitFor(o.Store, r.ID, func(ev run.Event) {
-					cb("event", ev)
-				})
-				verdict, reason, verdictErr := o.readVerdict(r.ID)
-				if verdictErr != nil {
-					cb("verdict_error", t.ID, verdictErr)
-					verdict = "reject"
-					reason = "no valid verdict in run metadata: " + verdictErr.Error()
-				}
-				if o.ManualApprove && t.Type == task.TypeQAVerify && verdict == "approve" {
-					if o.Prompt != nil {
-						cb("awaiting_manual_approval", t.ID)
-						verdict, reason = o.Prompt(t.ID)
-						cb("manual_verdict", t.ID, verdict, reason)
-					}
-				}
-				if verdict == "approve" {
-					proj, _ := project.Get(o.Store, e.ProjectID)
-					g, err := gate.Run(o.Store, t, r, proj)
-					if err != nil {
-						cb("gate_error", t.ID, err)
-						verdict = "reject"
-						reason = "gate check error: " + err.Error()
-					} else if !g.Passed {
-						cb("gate_failed", t.ID, g.Errors)
-						verdict = "reject"
-						reason = "gate checks failed: " + strings.Join(g.Errors, "; ")
-					}
-				}
-				mu.Lock()
-				results[t.ID] = &taskResult{t: t, r: r, verdict: verdict, reason: reason}
-				mu.Unlock()
-			}(t, r)
-		}
-		wg.Wait()
-
-		for _, res := range results {
-			ready := res.t
-			verdict := res.verdict
-			reason := res.reason
-
-			cb("task_verdict", ready.ID, verdict, reason)
-
-			if verdict == "approve" {
-				ready.Status = task.StatusApproved
-				ready.EndedAt = time.Now().UTC().Format(time.RFC3339)
-				_ = task.Update(o.Store, ready)
-
-				if ready.Type == task.TypePMConsistency {
-					e.Status = "done"
-					_ = epic.Update(o.Store, e)
-					cb("epic_done", e.ID)
-					return nil
-				}
-
-				nextType := transitions[ready.Type]["approved"]
-				if ready.Type == task.TypeResearch {
-					if err := o.copyResearchDoc(ready); err != nil {
-						cb("research_doc_error", ready.ID, err)
-					}
-				}
-				if ready.Type == task.TypePMPlan {
-					if err := o.copyPlanDoc(ready); err != nil {
-						cb("plan_doc_error", ready.ID, err)
-					}
-				}
-				if ready.Type == task.TypeEngineering {
-					if err := o.mergeEngineeringWorktree(ready); err != nil {
-						cb("merge_error", ready.ID, err)
-					}
-				}
-				if nextType == "" || nextType == task.TypeQAVerify {
-					cb("task_done", ready.ID)
-					continue
-				}
-				if nextType == task.TypeEngineering {
-					if err := o.expandEngineering(ready); err != nil {
-						return err
-					}
-				} else {
-					if _, err := task.Create(o.Store, &task.Task{
-						Title:       o.nextTitle(nextType, ready),
-						Type:        nextType,
-						ProjectID:   e.ProjectID,
-						EpicID:      e.ID,
-						ParentID:    ready.ID,
-						TeamID:      proj.DefaultTeam,
-						Description: ready.Description,
-					}); err != nil {
-						return err
-					}
-				}
-			} else {
-				ready.Status = task.StatusRejected
-				_ = task.Update(o.Store, ready)
-
-				maxRedo := o.MaxRedo
-				if maxRedo <= 0 {
-					maxRedo = 3
-				}
-				if ready.RedoIndex >= maxRedo {
-					cb("task_failed", ready.ID, "max redo attempts reached")
-					continue
-				}
-
-				redoType := transitions[ready.Type]["rejected"]
-				if redoType == "" {
-					redoType = ready.Type
-				}
-				redo, err := task.Redo(o.Store, ready, reason)
-				if err != nil {
-					return err
-				}
-				redo.Type = redoType
-				_ = task.Update(o.Store, redo)
-				cb("redo_created", redo.ID, redoType, reason)
+			verdict, reason, err := o.runTaskToVerdict(t, r, cb)
+			if err != nil {
+				return err
+			}
+			if err := o.applyTaskResolution(t, verdict, reason, e, proj, cb); err != nil {
+				return err
 			}
 		}
 	}
 }
 
-// nextReadyTasks returns all tasks that can start in parallel: one per group,
+func (o *Orchestrator) cleanupWatchLock(epicID string) {
+	lockPath := filepath.Join(o.Store.Root, ".watch-lock", epicID+".lock")
+	_ = os.Remove(lockPath)
+}
+
+func (o *Orchestrator) ensureResearchTask(e *epic.Epic, proj *project.Project) (*task.Task, error) {
+	children, err := task.ListByEpic(o.Store, e.ID)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range children {
+		if c.Type == task.TypeResearch {
+			return &c, nil
+		}
+	}
+	return task.Create(o.Store, &task.Task{
+		Title:       "Research: " + e.Title,
+		Description: e.Description,
+		Type:        task.TypeResearch,
+		ProjectID:   e.ProjectID,
+		EpicID:      e.ID,
+		TeamID:      proj.DefaultTeam,
+	})
+}
+
+func (o *Orchestrator) runTaskToVerdict(t *task.Task, r *run.Run, cb func(string, ...interface{})) (string, string, error) {
+	waitErr := run.WaitFor(o.Store, r.ID, func(ev run.Event) {
+		cb("event", ev)
+	})
+	if waitErr != nil {
+		cb("wait_error", waitErr)
+	}
+
+	verdict, reason, verdictErr := o.readVerdict(r.ID)
+	if verdictErr != nil {
+		cb("verdict_error", t.ID, verdictErr)
+		verdict = "reject"
+		reason = "no valid verdict in run metadata: " + verdictErr.Error()
+	}
+
+	// Policy: human-in-the-loop override for configured task types.
+	if verdict == "approve" && o.policy().RequiresHumanOverride(string(t.Type)) {
+		if o.Prompt != nil {
+			cb("awaiting_manual_approval", t.ID)
+			verdict, reason = o.Prompt(t.ID)
+			cb("manual_verdict", t.ID, verdict, reason)
+		}
+	}
+
+	t.Status = task.StatusPendingReview
+	t.Verdict = verdict
+	t.VerdictReason = reason
+	_ = task.Update(o.Store, t)
+	cb("task_verdict", t.ID, verdict, reason)
+
+	if verdict == "approve" {
+		proj, _ := project.Get(o.Store, t.ProjectID)
+		g, err := gate.Run(o.Store, t, r, proj)
+		if err != nil {
+			cb("gate_error", t.ID, err)
+			verdict = "reject"
+			reason = "gate check error: " + err.Error()
+		} else if !g.Passed {
+			cb("gate_failed", t.ID, g.Errors)
+			verdict = "reject"
+			reason = "gate checks failed: " + strings.Join(g.Errors, "; ")
+		}
+		if verdict != "approve" {
+			t.Status = task.StatusPendingReview
+			t.Verdict = verdict
+			t.VerdictReason = reason
+			_ = task.Update(o.Store, t)
+			cb("task_verdict", t.ID, verdict, reason)
+		}
+	}
+
+	// Policy: require explicit disposition, auto-approve stale pending tasks.
+	verdict, reason = o.applyPolicy(t, verdict, reason)
+	if t.Verdict != verdict || t.VerdictReason != reason {
+		t.Verdict = verdict
+		t.VerdictReason = reason
+		_ = task.Update(o.Store, t)
+		cb("task_verdict", t.ID, verdict, reason)
+	}
+
+	return verdict, reason, nil
+}
+
+// policy returns the workspace task policy, defaulting to sane values.
+func (o *Orchestrator) policy() config.TaskPolicy {
+	cfg, err := config.LoadOrCreate(o.Store.Root)
+	if err != nil {
+		return config.TaskPolicy{}
+	}
+	return cfg.Policy
+}
+
+// applyPolicy enforces require_disposition_for and auto_approve_after.
+// It mutates t.Status and t.EndedAt when auto-approving.
+func (o *Orchestrator) applyPolicy(t *task.Task, verdict, reason string) (string, string) {
+	pol := o.policy()
+
+	// Require explicit disposition: anything other than approve/reject is rejected.
+	if !t.HasValidVerdict() && pol.RequiresDisposition(string(t.Type)) {
+		return "reject", "policy requires explicit disposition: " + t.DispositionReason()
+	}
+
+	// If the agent produced a clear approve, mark the task as approved now so
+	// it does not get stuck in pending_review waiting for a resolution pass
+	// that may never come (e.g. watch mode where only open tasks are selected).
+	if verdict == "approve" {
+		t.Status = task.StatusApproved
+		t.EndedAt = time.Now().UTC().Format(time.RFC3339)
+		return verdict, reason
+	}
+
+	// Auto-approve tasks stuck in pending_review beyond the configured duration.
+	if verdict != "approve" && pol.AutoApproveDuration() > 0 && t.IsStale(pol.AutoApproveDuration()) {
+		t.Status = task.StatusApproved
+		t.EndedAt = time.Now().UTC().Format(time.RFC3339)
+		return "approve", "policy auto-approve after " + pol.AutoApproveAfter
+	}
+
+	return verdict, reason
+}
+
+func (o *Orchestrator) applyTaskResolution(t *task.Task, verdict, reason string, e *epic.Epic, proj *project.Project, cb func(string, ...interface{})) error {
+	if verdict == "approve" {
+		t.Status = task.StatusApproved
+		t.EndedAt = time.Now().UTC().Format(time.RFC3339)
+		_ = task.Update(o.Store, t)
+
+		if t.Type == task.TypePMConsistency {
+			e.Status = "done"
+			_ = epic.Update(o.Store, e)
+			cb("epic_done", e.ID)
+			return nil
+		}
+
+		nextType := transitions[t.Type]["approved"]
+		if t.Type == task.TypeResearch {
+			if err := o.copyResearchDoc(t); err != nil {
+				cb("research_doc_error", t.ID, err)
+			}
+		}
+		if t.Type == task.TypePMPlan {
+			if err := o.copyPlanDoc(t); err != nil {
+				cb("plan_doc_error", t.ID, err)
+			}
+		}
+		if err := o.mergeApprovedWorktree(t); err != nil {
+			cb("merge_error", t.ID, err)
+		}
+
+		if nextType == "" || nextType == task.TypeQAVerify {
+			cb("task_done", t.ID)
+			return nil
+		}
+		if nextType == task.TypeEngineering {
+			if err := o.expandEngineering(t); err != nil {
+				return err
+			}
+			return nil
+		}
+		if _, err := task.Create(o.Store, &task.Task{
+			Title:       o.nextTitle(nextType, t),
+			Type:        nextType,
+			ProjectID:   e.ProjectID,
+			EpicID:      e.ID,
+			ParentID:    t.ID,
+			TeamID:      proj.DefaultTeam,
+			Description: t.Description,
+		}); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Reject path: normal redo or senior/recovery escalation when max redo reached.
+	t.Status = task.StatusRejected
+	t.EndedAt = time.Now().UTC().Format(time.RFC3339)
+	_ = task.Update(o.Store, t)
+
+	pol := o.policy()
+	if t.RedoIndex >= pol.MaxRedo()-1 && t.EscalatedTo == "" {
+		recoveryTask, err := o.escalateToSenior(t, e, proj, reason)
+		if err != nil {
+			cb("escalation_error", t.ID, err)
+			// No senior agent configured. Stop the loop instead of creating
+			// another redo that will hit the same gate and loop forever.
+			t.Status = task.StatusDone
+			t.VerdictReason = "max redo reached (" + strconv.Itoa(t.RedoIndex+1) + ") and no senior agent configured: " + reason
+			_ = task.Update(o.Store, t)
+			cb("max_redo_exhausted", t.ID, t.VerdictReason)
+			return nil
+		} else {
+			cb("escalated_to_senior", recoveryTask.ID, recoveryTask.AssignedAgentName, reason)
+			// Do not create a normal redo; the recovery task is a fresh group for
+			// the senior agent to take over manually.
+			return nil
+		}
+	}
+
+	redoType := transitions[t.Type]["rejected"]
+	if redoType == "" {
+		redoType = t.Type
+	}
+	redo, err := task.Redo(o.Store, t, reason)
+	if err != nil {
+		return err
+	}
+	redo.Type = redoType
+	_ = task.Update(o.Store, redo)
+	if redoType == task.TypeEngineering {
+		if err := o.updateDependenciesAfterRedo(t, redo); err != nil {
+			cb("redo_dep_update_error", redo.ID, err)
+		}
+	}
+	cb("redo_created", redo.ID, redoType, reason)
+	return nil
+}
+
+// escalateToSenior creates a recovery task assigned to a senior/recovery agent.
+// The rejected base task is marked done; the recovery task inherits the base's
+// upstream dependencies so it can run immediately.
+func (o *Orchestrator) escalateToSenior(base *task.Task, e *epic.Epic, proj *project.Project, reason string) (*task.Task, error) {
+	seniorTeam, seniorAgent, profile := o.findSeniorAgent(proj.DefaultTeam)
+	if seniorTeam == "" || seniorAgent == "" {
+		return nil, errors.New("no senior/recovery agent configured in team " + proj.DefaultTeam)
+	}
+	base.Status = task.StatusDone
+	base.EndedAt = time.Now().UTC().Format(time.RFC3339)
+	base.Verdict = "escalated"
+	base.VerdictReason = "max redo reached; escalated to senior: " + reason
+	if err := task.Update(o.Store, base); err != nil {
+		return nil, err
+	}
+	recovery := &task.Task{
+		Title:             "Recovery: " + base.Title,
+		Description:       base.Description,
+		Type:              task.TypeRecovery,
+		ProjectID:         e.ProjectID,
+		EpicID:            e.ID,
+		ParentID:          base.ID,
+		TeamID:            seniorTeam,
+		AssignedAgentName: seniorAgent,
+		AssignedProfile:   profile,
+		Dependencies:      append([]string(nil), base.Dependencies...),
+		Group:             base.Group,
+		EscalatedTo:       seniorAgent,
+		EscalatedAt:       time.Now().UTC().Format(time.RFC3339),
+	}
+	if created, err := task.Create(o.Store, recovery); err != nil {
+		return nil, err
+	} else {
+		return created, nil
+	}
+}
+
+// findSeniorAgent looks for an agent with role senior/recovery/lead in the given team.
+// It returns teamID, agentName, profile. Empty strings mean not found.
+func (o *Orchestrator) findSeniorAgent(teamID string) (string, string, string) {
+	tm, err := team.Get(o.Store, teamID)
+	if err != nil {
+		return "", "", ""
+	}
+	for _, role := range []string{"senior", "recovery", "lead"} {
+		for name, ref := range tm.Agents {
+			if strings.EqualFold(ref.Role, role) {
+				return tm.ID, name, ref.Profile
+			}
+		}
+	}
+	return "", "", ""
+}
+
+// Expand first-run helpers.
 // with dependencies satisfied.
 func (o *Orchestrator) nextReadyTasks(epicID string) ([]task.Task, error) {
 	tasks, err := task.ListByEpic(o.Store, epicID)
@@ -512,6 +544,26 @@ func (o *Orchestrator) nextReadyTasks(epicID string) ([]task.Task, error) {
 	})
 
 	return ready, nil
+}
+
+// nextPendingReviewTasks returns tasks that already have a valid verdict but
+// are still in pending_review, so the loop can apply their resolution.
+func (o *Orchestrator) nextPendingReviewTasks(epicID string) ([]task.Task, error) {
+	tasks, err := task.ListByEpic(o.Store, epicID)
+	if err != nil {
+		return nil, err
+	}
+	var pending []task.Task
+	for _, t := range tasks {
+		if t.Status != task.StatusPendingReview {
+			continue
+		}
+		if t.Verdict != "approve" && t.Verdict != "reject" {
+			continue
+		}
+		pending = append(pending, t)
+	}
+	return pending, nil
 }
 
 // nextReadyTask returns the next task that can start.
@@ -589,10 +641,19 @@ func (o *Orchestrator) copyPlanDoc(pmTask *task.Task) error {
 		return err
 	}
 	runs, err := run.ListByTask(o.Store, pmTask.ID)
-	if err != nil || len(runs) == 0 {
+	if err != nil {
+		return err
+	}
+	var wt string
+	for i := len(runs) - 1; i >= 0; i-- {
+		if runs[i].ProjectID == pmTask.ProjectID {
+			wt = runs[i].Worktree
+			break
+		}
+	}
+	if wt == "" {
 		return errors.New("no run for PM plan task")
 	}
-	wt := runs[0].Worktree
 	if wt == "" {
 		return errors.New("PM plan run has no worktree")
 	}
@@ -600,10 +661,33 @@ func (o *Orchestrator) copyPlanDoc(pmTask *task.Task) error {
 	if _, err := os.Stat(src); err != nil {
 		return fmt.Errorf("docs/plan.json not found in worktree: %w", err)
 	}
-	if err := project.AddDoc(o.Store, proj.ID, src); err != nil {
-		return fmt.Errorf("AddDoc failed for plan.json: %w", err)
+	if proj.DocsDir != "" {
+		docsDir := filepath.Join(proj.DocsDir, "docs")
+		if err := os.MkdirAll(docsDir, 0o755); err != nil {
+			return fmt.Errorf("mkdir docs dir failed: %w", err)
+		}
+		dst := filepath.Join(docsDir, "plan.json")
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return fmt.Errorf("read plan.json failed: %w", err)
+		}
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			return fmt.Errorf("write plan.json to docs dir failed: %w", err)
+		}
 	}
-	return nil
+	// Also place docs/plan.json at the project repo root so consistency checks can find it.
+	if proj.RepoPath != "" {
+		docsDir := filepath.Join(proj.RepoPath, "docs")
+		_ = os.MkdirAll(docsDir, 0o755)
+		dst := filepath.Join(docsDir, "plan.json")
+		data, _ := os.ReadFile(src)
+		if len(data) > 0 {
+			_ = os.WriteFile(dst, data, 0o644)
+			_ = exec.Command("git", "-C", proj.RepoPath, "add", "docs/plan.json").Run()
+			_ = exec.Command("git", "-C", proj.RepoPath, "commit", "-m", "docs: add plan.json").Run()
+		}
+	}
+	return project.AddDoc(o.Store, proj.ID, src)
 }
 
 // expandEngineering reads the PM plan output, validates it, and creates engineering tasks.
@@ -615,10 +699,19 @@ func (o *Orchestrator) copyResearchDoc(researchTask *task.Task) error {
 		return err
 	}
 	runs, err := run.ListByTask(o.Store, researchTask.ID)
-	if err != nil || len(runs) == 0 {
+	if err != nil {
+		return err
+	}
+	var wt string
+	for i := len(runs) - 1; i >= 0; i-- {
+		if runs[i].ProjectID == researchTask.ProjectID {
+			wt = runs[i].Worktree
+			break
+		}
+	}
+	if wt == "" {
 		return errors.New("no run for research task")
 	}
-	wt := runs[0].Worktree
 	if wt == "" {
 		return errors.New("research run has no worktree")
 	}
@@ -629,12 +722,53 @@ func (o *Orchestrator) copyResearchDoc(researchTask *task.Task) error {
 	if err := project.AddDoc(o.Store, proj.ID, src); err != nil {
 		return fmt.Errorf("AddDoc failed: %w", err)
 	}
+	// Also place RESEARCH.md at the project repo root so downstream consistency checks can find it.
+	if proj.RepoPath != "" {
+		dst := filepath.Join(proj.RepoPath, "RESEARCH.md")
+		data, _ := os.ReadFile(src)
+		if len(data) > 0 {
+			_ = os.WriteFile(dst, data, 0o644)
+			_ = exec.Command("git", "-C", proj.RepoPath, "add", "RESEARCH.md").Run()
+			_ = exec.Command("git", "-C", proj.RepoPath, "commit", "-m", "docs: add RESEARCH.md").Run()
+		}
+	}
 	return nil
 }
 
-// mergeEngineeringWorktree merges the approved engineering worktree branch back into
-// the project's main repo so that subsequent engineering tasks inherit the state.
-func (o *Orchestrator) mergeEngineeringWorktree(t *task.Task) error {
+// updateDependenciesAfterRedo replaces references to the rejected task ID
+// with the new redo task ID in all downstream task dependencies.
+func (o *Orchestrator) updateDependenciesAfterRedo(rejected, redo *task.Task) error {
+	all, err := task.List(o.Store)
+	if err != nil {
+		return err
+	}
+	for _, tt := range all {
+		if tt.EpicID != redo.EpicID {
+			continue
+		}
+		if tt.ID == redo.ID {
+			continue
+		}
+		updated := false
+		for i, dep := range tt.Dependencies {
+			if dep == rejected.ID {
+				tt.Dependencies[i] = redo.ID
+				updated = true
+			}
+		}
+		if updated {
+			if err := task.Update(o.Store, &tt); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// mergeApprovedWorktree merges the approved engineering worktree branch back into
+// the project's main repo and advances the project's base commit so that
+// downstream runs start from the updated state.
+func (o *Orchestrator) mergeApprovedWorktree(t *task.Task) error {
 	proj, err := project.Get(o.Store, t.ProjectID)
 	if err != nil {
 		return err
@@ -646,15 +780,71 @@ func (o *Orchestrator) mergeEngineeringWorktree(t *task.Task) error {
 	if err != nil || len(runs) == 0 {
 		return errors.New("no run for engineering task")
 	}
-	r := runs[0]
-	if r.Branch == "" || r.Worktree == "" {
+	// Use the latest finished run for this task in the same project.
+	var r *run.Run
+	for i := len(runs) - 1; i >= 0; i-- {
+		if runs[i].ProjectID == t.ProjectID {
+			r = &runs[i]
+			break
+		}
+	}
+	if r == nil || r.Branch == "" || r.Worktree == "" {
 		return nil
 	}
-	// Ensure worktree commits are on top of current main.
-	if out, err := exec.Command("git", "-C", proj.RepoPath, "merge", "-Xtheirs", "-m", "merge "+t.ID, r.Branch).CombinedOutput(); err != nil {
-		return fmt.Errorf("merge failed: %w\n%s", err, out)
+	// Pull any new files from the worktree back into the branch so the merge
+	// includes everything the agent produced, even uncommitted changes.
+	_ = exec.Command("git", "-C", r.Worktree, "add", "-A").Run()
+	if _, err := exec.Command("git", "-C", r.Worktree, "diff", "--cached", "--quiet").CombinedOutput(); err != nil {
+		if out, err := exec.Command("git", "-C", r.Worktree, "commit", "-m", fmt.Sprintf("agent: %s %s", t.Type, t.ID)).CombinedOutput(); err != nil {
+			return fmt.Errorf("commit worktree failed: %w\n%s", err, out)
+		}
+	}
+	// Fast-forward main to the approved branch when possible.
+	out, err := exec.Command("git", "-C", proj.RepoPath, "merge", "--ff-only", r.Branch).CombinedOutput()
+	if err != nil {
+		// main has moved on; rebase the approved branch onto the default
+		// branch (main or master) and try ff-only again.
+		defaultBranch := gitDefaultBranch(proj.RepoPath)
+		if rb, err := exec.Command("git", "-C", r.Worktree, "rebase", defaultBranch).CombinedOutput(); err != nil {
+			_ = exec.Command("git", "-C", r.Worktree, "rebase", "--abort").Run()
+			return fmt.Errorf("rebase worktree onto %s failed: %w\\n%s", defaultBranch, err, rb)
+		}
+		out, err = exec.Command("git", "-C", proj.RepoPath, "merge", "--ff-only", r.Branch).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("merge failed after rebase: %w\n%s", err, out)
+		}
+	}
+	// Update project base commit so that new worktrees start from the merged state.
+	head, err := currentHeadCommit(proj.RepoPath)
+	if err != nil {
+		return fmt.Errorf("failed to read merged HEAD: %w", err)
+	}
+	proj.BaseCommit = head
+	if err := project.Update(o.Store, proj); err != nil {
+		return fmt.Errorf("failed to update project base commit: %w", err)
 	}
 	return nil
+}
+
+func currentHeadCommit(repoPath string) (string, error) {
+	if repoPath == "" {
+		return "", errors.New("no repo path")
+	}
+	out, err := exec.Command("git", "-C", repoPath, "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", err, out)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// gitDefaultBranch returns the default branch name of a repo (main or master).
+func gitDefaultBranch(repoPath string) string {
+	// Check if "main" exists.
+	if out, err := exec.Command("git", "-C", repoPath, "rev-parse", "--verify", "main").CombinedOutput(); err == nil && len(out) > 0 {
+		return "main"
+	}
+	// Fall back to master.
+	return "master"
 }
 
 func (o *Orchestrator) expandEngineering(pmTask *task.Task) error {

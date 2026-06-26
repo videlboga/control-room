@@ -7,10 +7,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	"control-room/internal/comment"
 	"control-room/internal/config"
 	"control-room/internal/epic"
 	"control-room/internal/orchestrator"
@@ -19,6 +21,7 @@ import (
 	"control-room/internal/store"
 	"control-room/internal/task"
 	"control-room/internal/team"
+	"gopkg.in/yaml.v3"
 	"github.com/spf13/cobra"
 )
 
@@ -32,7 +35,7 @@ func NewRootCmd() *cobra.Command {
 		Short: "Hermes Workspace -- lightweight project/team/run orchestrator",
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			if root == "" {
-				root = "/home/cyberkitty/.control-room"
+				root = config.DefaultWorkspace()
 			}
 			cfg, err := config.LoadOrCreate(root)
 			if err != nil {
@@ -61,6 +64,7 @@ func NewRootCmd() *cobra.Command {
 	rootCmd.AddCommand(taskCmd())
 	rootCmd.AddCommand(orchestrateCmd())
 	rootCmd.AddCommand(runCmd())
+	rootCmd.AddCommand(workspaceCmd())
 	return rootCmd
 }
 
@@ -252,18 +256,28 @@ func taskCmd() *cobra.Command {
 			teamID, _ := cmd.Flags().GetString("team")
 			desc, _ := cmd.Flags().GetString("description")
 			typ, _ := cmd.Flags().GetString("type")
+			provider, _ := cmd.Flags().GetString("provider")
+			model, _ := cmd.Flags().GetString("model")
+			maxTurns, _ := cmd.Flags().GetInt("max-turns")
+			timeout, _ := cmd.Flags().GetString("timeout")
 			t := &task.Task{
 				Title:       title,
 				ProjectID:   projectID,
 				TeamID:      teamID,
 				Type:        task.TaskType(typ),
 				Description: desc,
+				RuntimeConfig: config.RuntimeConfig{
+					Provider: provider,
+					Model:    model,
+					MaxTurns: maxTurns,
+					Timeout:  timeout,
+				},
 			}
 			created, err := task.Create(st, t)
 			if err != nil {
 				return err
 			}
-			fmt.Printf("task %s created\n", created.ID)
+			fmt.Printf("task %s (%s) created\n", created.DisplayID, created.ID)
 			return nil
 		},
 	}
@@ -272,6 +286,10 @@ func taskCmd() *cobra.Command {
 	create.Flags().String("team", "", "team id")
 	create.Flags().String("description", "", "task description")
 	create.Flags().String("type", "engineering", "task type: research, qa_review, pm_plan, engineering, qa_verify, pm_consistency")
+	create.Flags().String("provider", "", "Hermes provider override (e.g. ollama-cloud)")
+	create.Flags().String("model", "", "Hermes model override (e.g. kimi-k2.7-code)")
+	create.Flags().Int("max-turns", 0, "max turns override")
+	create.Flags().String("timeout", "", "timeout override (e.g. 30m)")
 	for _, f := range []string{"title", "project", "team", "type"} {
 		_ = create.MarkFlagRequired(f)
 	}
@@ -287,7 +305,7 @@ func taskCmd() *cobra.Command {
 				return err
 			}
 			for _, t := range tasks {
-				fmt.Printf("%s\t%s\t%s\t%s\n", t.ID, t.Status, t.ProjectID, t.Title)
+				fmt.Printf("%s\t%s\t%s\t%s\t%s\n", t.DisplayID, t.ID, t.Status, t.ProjectID, t.Title)
 			}
 			return nil
 		},
@@ -310,7 +328,57 @@ func taskCmd() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(create, list, show)
+
+	commentCmd := &cobra.Command{
+		Use:   "comment",
+		Short: "Add or list comments on a task",
+	}
+	commentAdd := &cobra.Command{
+		Use:   "add [task-id]",
+		Short: "Add a comment to a task",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			t, err := task.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			body, _ := cmd.Flags().GetString("body")
+			author, _ := cmd.Flags().GetString("author")
+			created, err := comment.Add(st, "task", t.ID, author, body)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("comment %s added to task %s\n", created.ID, t.DisplayID)
+			return nil
+		},
+	}
+	commentAdd.Flags().String("body", "", "comment text")
+	commentAdd.Flags().String("author", "system", "comment author")
+	_ = commentAdd.MarkFlagRequired("body")
+	commentList := &cobra.Command{
+		Use:   "list [task-id]",
+		Short: "List comments on a task",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			t, err := task.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			comments, err := comment.List(st, "task", t.ID)
+			if err != nil {
+				return err
+			}
+			for _, c := range comments {
+				fmt.Printf("%s\t%s\t%s\n", c.CreatedAt, c.Author, c.Body)
+			}
+			return nil
+		},
+	}
+	commentCmd.AddCommand(commentAdd, commentList)
+
+	cmd.AddCommand(create, list, show, commentCmd)
 	return cmd
 }
 
@@ -337,7 +405,7 @@ func epicCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Printf("epic %s created\n", created.ID)
+			fmt.Printf("epic %s (%s) created\n", created.DisplayID, created.ID)
 			return nil
 		},
 	}
@@ -358,7 +426,7 @@ func epicCmd() *cobra.Command {
 				return err
 			}
 			for _, e := range epics {
-				fmt.Printf("%s\t%s\t%s\t%s\n", e.ID, e.Status, e.ProjectID, e.Title)
+				fmt.Printf("%s\t%s\t%s\t%s\t%s\n", e.DisplayID, e.ID, e.Status, e.ProjectID, e.Title)
 			}
 			return nil
 		},
@@ -380,7 +448,57 @@ func epicCmd() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(create, list, show)
+
+	commentCmd := &cobra.Command{
+		Use:   "comment",
+		Short: "Add or list comments on an epic",
+	}
+	commentAdd := &cobra.Command{
+		Use:   "add [epic-id]",
+		Short: "Add a comment to an epic",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			e, err := epic.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			body, _ := cmd.Flags().GetString("body")
+			author, _ := cmd.Flags().GetString("author")
+			created, err := comment.Add(st, "epic", e.ID, author, body)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("comment %s added to epic %s\n", created.ID, e.DisplayID)
+			return nil
+		},
+	}
+	commentAdd.Flags().String("body", "", "comment text")
+	commentAdd.Flags().String("author", "system", "comment author")
+	_ = commentAdd.MarkFlagRequired("body")
+	commentList := &cobra.Command{
+		Use:   "list [epic-id]",
+		Short: "List comments on an epic",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			e, err := epic.Get(st, args[0])
+			if err != nil {
+				return err
+			}
+			comments, err := comment.List(st, "epic", e.ID)
+			if err != nil {
+				return err
+			}
+			for _, c := range comments {
+				fmt.Printf("%s\t%s\t%s\n", c.CreatedAt, c.Author, c.Body)
+			}
+			return nil
+		},
+	}
+	commentCmd.AddCommand(commentAdd, commentList)
+
+	cmd.AddCommand(create, list, show, commentCmd)
 	return cmd
 }
 
@@ -444,7 +562,22 @@ func orchestrateCmd() *cobra.Command {
 	watch.Flags().Bool("manual-approve", false, "prompt for manual approval on QA verify tasks")
 	_ = watch.MarkFlagRequired("epic")
 
-	cmd.AddCommand(run, watch)
+	watchAll := &cobra.Command{
+		Use:   "watch-all",
+		Short: "Start detached watch for all in-progress epics (one sweep)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			cr := &orchestrator.WatchCron{Store: st}
+			started, err := cr.Run()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("started watch for %d epic(s)\n", started)
+			return nil
+		},
+	}
+
+	cmd.AddCommand(run, watch, watchAll)
 	return cmd
 }
 
@@ -482,7 +615,7 @@ func runCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Printf("run %s started for task %s\n", r.ID, taskID)
+			fmt.Printf("run %s (%s) started for task %s\n", r.DisplayID, r.ID, taskID)
 			return run.WaitFor(st, r.ID, func(ev run.Event) {
 				ts := ev.Timestamp
 				if len(ts) > 19 {
@@ -599,10 +732,21 @@ func spawnDetached(cmd *cobra.Command, taskID string, maxConcurrent int) error {
 func storeFromFlags(cmd *cobra.Command) *store.Store {
 	root, _ := cmd.Flags().GetString("workspace")
 	if root == "" {
-		root = "/home/cyberkitty/.control-room"
+		root = config.DefaultWorkspace()
 	}
 	cfg, _ := config.LoadOrCreate(root)
-	s := store.New(root)
+	var s *store.Store
+	if cfg != nil && cfg.Backend == "postgres" {
+		b, err := store.NewPostgresBackend(root, cfg.PostgresDSN)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "postgres backend failed, falling back to json: %v\n", err)
+			s = store.New(root)
+		} else {
+			s = store.NewWithBackend(root, b)
+		}
+	} else {
+		s = store.New(root)
+	}
 	if cfg != nil {
 		s.HermesUser = cfg.HermesUser
 		s.HermesSourceProfile = cfg.HermesSourceProfile
@@ -625,3 +769,141 @@ func storeFromFlags(cmd *cobra.Command) *store.Store {
 }
 
 var _ = time.Now
+
+func workspaceCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "workspace", Short: "Inspect and configure the workspace"}
+
+	policy := &cobra.Command{
+		Use:   "policy",
+		Short: "Show current workspace policy",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, _ := cmd.Flags().GetString("workspace")
+			if root == "" {
+				root = config.DefaultWorkspace()
+			}
+			cfg, err := config.LoadOrCreate(root)
+			if err != nil {
+				return err
+			}
+			data, err := yaml.Marshal(cfg.Policy)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("workspace: %s\n%s\n", root, string(data))
+			return nil
+		},
+	}
+
+	set := &cobra.Command{
+		Use:   "set-policy",
+		Short: "Set workspace policy flags",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, _ := cmd.Flags().GetString("workspace")
+			if root == "" {
+				root = config.DefaultWorkspace()
+			}
+			cfg, err := config.LoadOrCreate(root)
+			if err != nil {
+				return err
+			}
+			if cfg.Policy.RequireDispositionFor == nil {
+				cfg.Policy.RequireDispositionFor = []string{}
+			}
+			if cfg.Policy.HumanOverrideFor == nil {
+				cfg.Policy.HumanOverrideFor = []string{}
+			}
+			if v, err := cmd.Flags().GetStringSlice("require-disposition"); err == nil {
+				cfg.Policy.RequireDispositionFor = v
+			}
+			if v, err := cmd.Flags().GetStringSlice("human-override"); err == nil {
+				cfg.Policy.HumanOverrideFor = v
+			}
+			if v, err := cmd.Flags().GetString("auto-approve-after"); err == nil && v != "" {
+				cfg.Policy.AutoApproveAfter = v
+			}
+			if v, err := cmd.Flags().GetInt("max-redo"); err == nil && v > 0 {
+				cfg.Policy.MaxRedoAttempts = v
+			}
+			data, err := yaml.Marshal(cfg)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(root, "workspace.yaml"), data, 0o644); err != nil {
+				return err
+			}
+			fmt.Println("workspace policy updated")
+			return nil
+		},
+	}
+	set.Flags().StringSlice("require-disposition", []string{}, "task types that must produce an explicit verdict (e.g. qa_verify,pm_consistency)")
+	set.Flags().StringSlice("human-override", []string{}, "task types that require human approval (e.g. qa_verify)")
+	set.Flags().String("auto-approve-after", "", "auto-approve pending tasks after duration (e.g. 24h)")
+	set.Flags().Int("max-redo", 0, "max redo attempts before senior escalation")
+
+	cmd.AddCommand(policy, set)
+
+	runtime := &cobra.Command{
+		Use:   "runtime",
+		Short: "Show current workspace runtime config",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, _ := cmd.Flags().GetString("workspace")
+			if root == "" {
+				root = config.DefaultWorkspace()
+			}
+			cfg, err := config.LoadOrCreate(root)
+			if err != nil {
+				return err
+			}
+			data, err := yaml.Marshal(cfg.RuntimeConfig)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("workspace: %s\n%s\n", root, string(data))
+			return nil
+		},
+	}
+
+	setRuntime := &cobra.Command{
+		Use:   "set-runtime",
+		Short: "Set workspace runtime defaults",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			root, _ := cmd.Flags().GetString("workspace")
+			if root == "" {
+				root = config.DefaultWorkspace()
+			}
+			cfg, err := config.LoadOrCreate(root)
+			if err != nil {
+				return err
+			}
+			if v, err := cmd.Flags().GetString("provider"); err == nil && v != "" {
+				cfg.RuntimeConfig.Provider = v
+			}
+			if v, err := cmd.Flags().GetString("model"); err == nil && v != "" {
+				cfg.RuntimeConfig.Model = v
+			}
+			if v, err := cmd.Flags().GetInt("max-turns"); err == nil && v > 0 {
+				cfg.RuntimeConfig.MaxTurns = v
+			}
+			if v, err := cmd.Flags().GetString("timeout"); err == nil && v != "" {
+				cfg.RuntimeConfig.Timeout = v
+			}
+			data, err := yaml.Marshal(cfg)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(root, "workspace.yaml"), data, 0o644); err != nil {
+				return err
+			}
+			fmt.Println("workspace runtime config updated")
+			return nil
+		},
+	}
+	setRuntime.Flags().String("provider", "", "default Hermes provider")
+	setRuntime.Flags().String("model", "", "default Hermes model")
+	setRuntime.Flags().Int("max-turns", 0, "default max turns")
+	setRuntime.Flags().String("timeout", "", "default timeout")
+
+	cmd.AddCommand(runtime, setRuntime)
+	return cmd
+}
+
