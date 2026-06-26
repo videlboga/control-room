@@ -383,20 +383,20 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 	_ = logEvent(st, r, agentName, "step", "", step)
 	_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
 
-	prompt := buildPrompt(st, r, t, p, te, step, 0, nil)
-	maxTurns := r.RuntimeConfig.MaxTurns
-	if maxTurns <= 0 {
-		maxTurns = 60
-		if t.Type == task.TypeEngineering {
-			maxTurns = 120
-		}
-	}
+	prompt := stripNonBmp(buildPrompt(st, r, t, p, te, step, 0, previousRunResponses(st, t)))
 	cfg, _ := config.LoadOrCreate(st.Root)
 	defaults := config.RuntimeConfig{}
 	if cfg != nil {
 		defaults = cfg.RuntimeConfig
 	}
 	rtc := r.RuntimeConfig.Merge(defaults)
+	maxTurns := rtc.MaxTurns
+	if maxTurns <= 0 {
+		maxTurns = 60
+		if t.Type == task.TypeEngineering {
+			maxTurns = 120
+		}
+	}
 	activityPath := filepath.Join(st.Root, "runs", r.ID, "activity.log")
 	out, err := runHermes(user, profile, rtc.Provider, rtc.Model, prompt, r.Worktree, activityPath, maxTurns, func(pid int) {
 		r.PID = pid
@@ -410,6 +410,15 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 	}
 	_ = logEvent(st, r, agentName, "tool_call", "hermes", out)
 	writeRunMetadata(st, r, t, out, hermesFailed)
+
+	// Save the extracted agent response so redo runs can learn from it.
+	// Strip emoji and other supplementary-plane characters that can cause
+	// UTF-8 surrogate encoding errors when the response is fed back into
+	// a hermes chat prompt (Rich console fails on surrogates).
+	agentResponse := stripNonBmp(extractAgentResponse(out))
+	if agentResponse != "" {
+		_ = os.WriteFile(filepath.Join(st.Root, "runs", r.ID, "response.txt"), []byte(agentResponse), 0o644)
+	}
 
 	// Auto-commit any changes the agent produced so downstream worktrees inherit them.
 	if !hermesFailed && p.RepoPath != "" && r.Worktree != "" {
@@ -713,10 +722,6 @@ func runHermes(user, profile, provider, model, prompt, worktree, activityPath st
 	args := []string{
 		"--profile", profile,
 		"chat", "-q", prompt,
-		"--toolsets", "file,terminal",
-		"--yolo",
-		"--source", "tool",
-		"--max-turns", fmt.Sprintf("%d", maxTurns),
 	}
 	if provider != "" {
 		args = append(args, "--provider", provider)
@@ -724,19 +729,57 @@ func runHermes(user, profile, provider, model, prompt, worktree, activityPath st
 	if model != "" {
 		args = append(args, "--model", model)
 	}
+
 	hermesBin := "/home/" + user + "/.local/bin/hermes"
 	if _, err := os.Stat(hermesBin); err != nil {
 		hermesBin = "hermes"
 	}
-	baseArgs := append([]string{"-u", user, hermesBin}, args...)
-	cmd := exec.Command("sudo", baseArgs...)
+
+	// Check if we're already running as the target user — if so, skip sudo
+	// entirely. This avoids sudo's env_reset which strips LANG/PYTHONIOENCODING
+	// and causes UTF-8 surrogate encoding errors with Cyrillic prompts.
+	currentUser := os.Getenv("USER")
+	if currentUser == "" {
+		currentUser = filepath.Base(os.Getenv("HOME"))
+	}
+
+	fullArgs := append(args, "--toolsets", "file,terminal", "--yolo", "--source", "tool",
+		"--max-turns", fmt.Sprintf("%d", maxTurns))
+
+	// Build env with UTF-8 overrides (filter old values first).
+	envBase := os.Environ()
+	filtered := make([]string, 0, len(envBase)+5)
+	for _, e := range envBase {
+		if strings.HasPrefix(e, "LANG=") || strings.HasPrefix(e, "LC_") || strings.HasPrefix(e, "PYTHONIOENCODING=") || strings.HasPrefix(e, "PYTHONUTF8=") {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	cleanEnv := append(filtered,
+		"HOME=/home/"+user,
+		"PYTHONIOENCODING=utf-8",
+		"PYTHONUTF8=1",
+		"LANG=en_US.UTF-8",
+		"LC_ALL=en_US.UTF-8",
+	)
+
+	var cmd *exec.Cmd
+	if currentUser == user {
+		// Running as the same user — no sudo needed, env is set directly.
+		cmd = exec.Command(hermesBin, fullArgs...)
+		cmd.Env = cleanEnv
+	} else {
+		// Running as root/other — use sudo with env wrapper to survive env_reset.
+		envPrefix := []string{"env", "PYTHONIOENCODING=utf-8", "PYTHONUTF8=1", "LANG=en_US.UTF-8", "LC_ALL=en_US.UTF-8"}
+		sudoArgs := append([]string{"-u", user}, envPrefix...)
+		sudoArgs = append(sudoArgs, hermesBin)
+		sudoArgs = append(sudoArgs, fullArgs...)
+		cmd = exec.Command("sudo", sudoArgs...)
+		cmd.Env = cleanEnv
+	}
 	if worktree != "" {
 		cmd.Dir = worktree
 	}
-	// Preserve PATH and other env needed by Hermes when running under sudo.
-	cmd.Env = append(os.Environ(), "HOME=/home/"+user)
-	// Run hermes in its own process group so we can terminate the whole tree
-	// (hermes + any spawned children) on cancel or timeout.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	stdout, err := cmd.StdoutPipe()
@@ -896,6 +939,48 @@ func cleanHermesOutput(s string) string {
 	return strings.Join(out, "\n")
 }
 
+// previousRunResponses finds agent responses from previous runs in the same task group.
+// This allows redo iterations to learn from prior attempts instead of starting from scratch.
+func previousRunResponses(st *store.Store, t *task.Task) []string {
+	if t.Group == "" {
+		return nil
+	}
+	// Find all tasks in the same group with lower redo_index.
+	allTasks, err := task.List(st)
+	if err != nil {
+		return nil
+	}
+	var prevTaskIDs []string
+	for _, tt := range allTasks {
+		if tt.Group == t.Group && tt.RedoIndex < t.RedoIndex && tt.ID != t.ID {
+			prevTaskIDs = append(prevTaskIDs, tt.ID)
+		}
+	}
+	// For each previous task, find its run and read response.txt.
+	var responses []string
+	for _, tid := range prevTaskIDs {
+		runs, err := ListByTask(st, tid)
+		if err != nil {
+			continue
+		}
+		for _, r := range runs {
+			if r.Status != "done" {
+				continue
+			}
+			respPath := filepath.Join(st.Root, "runs", r.ID, "response.txt")
+			data, err := os.ReadFile(respPath)
+			if err != nil {
+				continue
+			}
+			text := strings.TrimSpace(stripNonBmp(string(data)))
+			if len(text) > 0 {
+				responses = append(responses, text)
+			}
+		}
+	}
+	return responses
+}
+
 func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team.Team, step string, stepIdx int, previous []string) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("You are the '%s' agent in team '%s'.\n", r.Agent, te.Name))
@@ -939,7 +1024,10 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 		b.WriteString("\nAs the researcher, study the task and environment, then write a RESEARCH.md file in the working directory. " +
 			"It must contain these exact sections with concrete decisions (not placeholders):\n" +
 			"# RESEARCH.md\n\n## Stack\n- Programming language and framework(s)\n- Frontend approach (e.g. htmx CDN + Go html/template)\n- Build/test commands to use\n\n## Architecture\n- Directory layout\n- Key files/components\n\n## Acceptance Criteria\n- Specific behaviors the implementation must satisfy\n\n## Engineering Notes\n- Constraints the coder/engineer must follow\n\n" +
-			"Do not write code. Only write RESEARCH.md. Before claiming the file is written, verify it exists with `ls RESEARCH.md`. The next QA reviewer will verify this document, and the PM/engineer will use it as the source of truth.\n")
+			"Do not write code. Only write RESEARCH.md. Before claiming the file is written, verify it exists with `ls RESEARCH.md`. The next QA reviewer will verify this document, and the PM/engineer will use it as the source of truth.\n\n" +
+			"CRITICAL: Never give up at the first obstacle. If a site requires auth — register (free if possible). If an API returns 302 — inspect cookies, try session auth. If data is hidden — open DevTools, intercept AJAX responses, check network traffic. If one approach fails — try at least 3 different approaches before declaring something inaccessible. " +
+			"Document every approach you tried in RESEARCH.md, including failures. Do NOT invent placeholder values when real data can be extracted. " +
+			"Acceptance criteria MUST reflect the actual task requirements, not a weakened version that is easier to satisfy.\n")
 	}
 	if t.Type == task.TypePMPlan {
 		b.WriteString("\nAs the PM planner, produce a detailed implementation plan. " +
@@ -970,11 +1058,19 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 			b.WriteString("\nMANDATORY: verify paths and files exist before referring to them. Use `ls`, `find`, or `git status` to confirm actual locations. Before giving your verdict, read RESEARCH.md in this worktree. " +
 				"Verify that it contains concrete Stack, Architecture, Acceptance Criteria and Engineering Notes sections. " +
 				"If the research document is missing or unclear, reject the task in your summary. " +
-				"docs/plan.json is NOT required for this review step.\n")
+				"docs/plan.json is NOT required for this review step.\n\n" +
+				"CRITICAL: Do NOT just read the document and approve. Independently verify the researcher's claims. " +
+				"If the researcher claims data is inaccessible — try to access it yourself (open the site, register, check DevTools). " +
+				"If the researcher weakened acceptance criteria (e.g. 'prices may differ' when the task says 'formulas must match') — reject. " +
+				"Minimum: open any external source referenced in the task and verify at least one claim independently.\n")
 		case task.TypeQAVerify:
 			b.WriteString("\nMANDATORY: verify paths and files exist before referring to them. Verify the implementation against RESEARCH.md acceptance criteria. " +
 				"Run the project test command and lint command if available. " +
-				"If tests fail or acceptance criteria are not met, reject the task in your summary.\n")
+				"If tests fail or acceptance criteria are not met, reject the task in your summary.\n\n" +
+				"CRITICAL: Do NOT just check that tests pass and files exist. Compare the actual output against the ORIGINAL source referenced in the task. " +
+				"If the task says 'formulas must match' — verify numerical equivalence with the original, not just structural similarity. " +
+				"If the task references an external site/API — open it and compare results for at least 2 test cases. " +
+				"If RESEARCH.md contains weakened criteria (e.g. 'prices may differ' when task says 'must match') — treat this as a defect and reject.\n")
 		default:
 			b.WriteString("\nRead RESEARCH.md and docs/plan.json in this worktree if they exist; use them as guidance. " +
 				"Follow the stack, architecture and acceptance criteria from RESEARCH.md when available. " +
@@ -982,15 +1078,16 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 		}
 	}
 	if len(previous) > 0 {
-		b.WriteString("\nPrevious steps (last 2 summaries):\n")
+		b.WriteString("\nPREVIOUS ATTEMPT FEEDBACK — learn from prior iterations, do NOT repeat the same mistakes:\n")
 		start := 0
-		if len(previous) > 2 {
-			start = len(previous) - 2
+		if len(previous) > 3 {
+			start = len(previous) - 3
 		}
 		for i := start; i < len(previous); i++ {
-			b.WriteString(truncate(previous[i], 800))
+			b.WriteString(truncate(previous[i], 4000))
 			b.WriteString("\n---\n")
 		}
+		b.WriteString("Use the above to avoid repeating failed approaches. If a previous attempt discovered something useful (e.g. an API endpoint, a data format, a working method), build on that knowledge instead of starting from scratch.\n")
 	}
 	b.WriteString(fmt.Sprintf("\nPerform the '%s' step and report a concise summary of what you did.", step))
 	b.WriteString("\n\nIMPORTANT: throughout your response, include a brief reasoning block before every significant decision or tool call. " +
@@ -1061,6 +1158,21 @@ func writeStubDiff(worktree, marker string) error {
 	_ = exec.Command("git", "-C", worktree, "add", "stub-output.md").Run()
 	// Leave the change staged but not committed so git diff HEAD is non-empty.
 	return nil
+}
+
+// stripNonBmp removes characters outside the Unicode Basic Multilingual Plane
+// (U+10000 and above, including emoji) that can cause surrogate encoding errors
+// when the text is passed through Python's Rich console or other UTF-8 streams
+// that reject surrogates.
+func stripNonBmp(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r > 0xFFFF {
+			continue // skip supplementary plane (emoji, etc.)
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // extractAgentResponse strips the hermes CLI framing (query, banners, resume hints)

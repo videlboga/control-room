@@ -21,6 +21,9 @@ jobs:
       - name: Build CLI
         run: go build -buildvcs=false -o ./cr ./cmd/cr
 
+      - name: Build Dashboard
+        run: go build -buildvcs=false -o ./dashboard ./cmd/dashboard
+
       - name: Run unit tests
         run: go test -buildvcs=false -race -count=1 ./...
 
@@ -30,9 +33,20 @@ jobs:
       - name: Lint check
         run: go vet -buildvcs=false ./...
 
+      - name: Build frontend
+        run: |
+          cd dashboard-frontend && npx vite build
+
       - name: Upload cr binary
         uses: actions/upload-artifact@v4
         with:
           name: cr-binary
           path: ./cr
+          if-no-files-found: error
+
+      - name: Upload dashboard binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-binary
+          path: ./dashboard
           if-no-files-found: error

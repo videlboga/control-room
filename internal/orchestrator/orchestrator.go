@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -404,7 +405,13 @@ func (o *Orchestrator) applyTaskResolution(t *task.Task, verdict, reason string,
 		recoveryTask, err := o.escalateToSenior(t, e, proj, reason)
 		if err != nil {
 			cb("escalation_error", t.ID, err)
-			// Fallback to normal redo if no senior agent is configured.
+			// No senior agent configured. Stop the loop instead of creating
+			// another redo that will hit the same gate and loop forever.
+			t.Status = task.StatusDone
+			t.VerdictReason = "max redo reached (" + strconv.Itoa(t.RedoIndex+1) + ") and no senior agent configured: " + reason
+			_ = task.Update(o.Store, t)
+			cb("max_redo_exhausted", t.ID, t.VerdictReason)
+			return nil
 		} else {
 			cb("escalated_to_senior", recoveryTask.ID, recoveryTask.AssignedAgentName, reason)
 			// Do not create a normal redo; the recovery task is a fresh group for
@@ -795,10 +802,12 @@ func (o *Orchestrator) mergeApprovedWorktree(t *task.Task) error {
 	// Fast-forward main to the approved branch when possible.
 	out, err := exec.Command("git", "-C", proj.RepoPath, "merge", "--ff-only", r.Branch).CombinedOutput()
 	if err != nil {
-		// main has moved on; rebase the approved branch onto main and try ff-only again.
-		if rb, err := exec.Command("git", "-C", r.Worktree, "rebase", "main").CombinedOutput(); err != nil {
+		// main has moved on; rebase the approved branch onto the default
+		// branch (main or master) and try ff-only again.
+		defaultBranch := gitDefaultBranch(proj.RepoPath)
+		if rb, err := exec.Command("git", "-C", r.Worktree, "rebase", defaultBranch).CombinedOutput(); err != nil {
 			_ = exec.Command("git", "-C", r.Worktree, "rebase", "--abort").Run()
-			return fmt.Errorf("rebase worktree onto main failed: %w\n%s", err, rb)
+			return fmt.Errorf("rebase worktree onto %s failed: %w\\n%s", defaultBranch, err, rb)
 		}
 		out, err = exec.Command("git", "-C", proj.RepoPath, "merge", "--ff-only", r.Branch).CombinedOutput()
 		if err != nil {
@@ -826,6 +835,16 @@ func currentHeadCommit(repoPath string) (string, error) {
 		return "", fmt.Errorf("%w: %s", err, out)
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// gitDefaultBranch returns the default branch name of a repo (main or master).
+func gitDefaultBranch(repoPath string) string {
+	// Check if "main" exists.
+	if out, err := exec.Command("git", "-C", repoPath, "rev-parse", "--verify", "main").CombinedOutput(); err == nil && len(out) > 0 {
+		return "main"
+	}
+	// Fall back to master.
+	return "master"
 }
 
 func (o *Orchestrator) expandEngineering(pmTask *task.Task) error {

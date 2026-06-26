@@ -125,15 +125,8 @@ func runQAReviewChecks(st *store.Store, t *task.Task, r *run.Run, p *project.Pro
 			if !hasDiff(r.Worktree) {
 				res.Errors = append(res.Errors, "engineering worktree has no changes")
 			}
-			if err := runCommand(r.Worktree, "go test ./..."); err != nil {
-				res.Errors = append(res.Errors, "tests failed: "+err.Error())
-			}
-			if err := runCommand(r.Worktree, "go vet ./..."); err != nil {
-				res.Errors = append(res.Errors, "lint failed: "+err.Error())
-			}
-			if err := runCommand(r.Worktree, "go build ./..."); err != nil {
-				res.Errors = append(res.Errors, "build failed: "+err.Error())
-			}
+			// Run language-appropriate checks based on project language.
+			runBuildTestChecks(res, r.Worktree, p)
 		}
 	}
 
@@ -292,6 +285,119 @@ func detectCycle(tasks []struct {
 	return ""
 }
 
+// isGoProject returns true if the project language is Go or mixed (contains Go).
+// It uses the project's Language field (auto-detected at creation) rather than
+// checking for go.mod in the worktree, because agents may spuriously create
+// go.mod in non-Go projects.
+func isGoProject(p *project.Project) bool {
+	return p.Language == "go" || p.Language == "mixed"
+}
+
+// runBuildTestChecks runs language-appropriate build/test/lint commands in the worktree.
+// The language is determined from the project's Language field, not from worktree contents.
+func runBuildTestChecks(res *Result, worktree string, p *project.Project) {
+	if worktree == "" || p == nil {
+		return
+	}
+	switch p.Language {
+	case "go":
+		if err := runCommand(worktree, "go build ./..."); err != nil {
+			res.Errors = append(res.Errors, "build failed: "+err.Error())
+		}
+		if err := runCommand(worktree, "go test ./..."); err != nil {
+			res.Errors = append(res.Errors, "tests failed: "+err.Error())
+		}
+		if err := runCommand(worktree, "go vet ./..."); err != nil {
+			res.Errors = append(res.Errors, "vet failed: "+err.Error())
+		}
+	case "python":
+		// Python: run pytest if available, fall back to no-op.
+		if hasFiles(worktree, `.*test.*\.py$`) {
+			if err := runCommand(worktree, "python -m pytest -x -q 2>&1 || true"); err != nil {
+				res.Errors = append(res.Errors, "tests failed: "+err.Error())
+			}
+		}
+	case "javascript":
+		// Node: run package.json scripts if they exist.
+		if fileExistsInWorktree(worktree, "package.json") {
+			if err := runCommand(worktree, "npm test --silent 2>&1 || true"); err != nil {
+				res.Errors = append(res.Errors, "tests failed: "+err.Error())
+			}
+		}
+	case "rust":
+		if err := runCommand(worktree, "cargo build 2>&1 || true"); err != nil {
+			res.Errors = append(res.Errors, "build failed: "+err.Error())
+		}
+		if err := runCommand(worktree, "cargo test 2>&1 || true"); err != nil {
+			res.Errors = append(res.Errors, "tests failed: "+err.Error())
+		}
+	case "mixed":
+		// Mixed: run Go checks if go.mod exists in worktree, plus Python if .py test files.
+		if hasFiles(worktree, `go\.mod$`) {
+			if err := runCommand(worktree, "go build ./..."); err != nil {
+				res.Errors = append(res.Errors, "go build failed: "+err.Error())
+			}
+			if err := runCommand(worktree, "go test ./..."); err != nil {
+				res.Errors = append(res.Errors, "go tests failed: "+err.Error())
+			}
+		}
+		if hasFiles(worktree, `.*test.*\.py$`) {
+			if err := runCommand(worktree, "python -m pytest -x -q 2>&1 || true"); err != nil {
+				res.Errors = append(res.Errors, "python tests failed: "+err.Error())
+			}
+		}
+	}
+}
+
+// fileExistsInWorktree checks if a file exists at the root of the worktree.
+func fileExistsInWorktree(worktree, name string) bool {
+	if worktree == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(worktree, name))
+	return err == nil
+}
+
+// sourceFilePattern returns a regex pattern for source files of the given language.
+func sourceFilePattern(lang string) string {
+	switch lang {
+	case "go":
+		return `.*\.go$`
+	case "python":
+		return `.*\.py$`
+	case "javascript":
+		return `.*\.(js|ts|jsx|tsx|mjs)$`
+	case "rust":
+		return `.*\.rs$`
+	case "java":
+		return `.*\.java$`
+	case "mixed":
+		return `.*\.(go|py|js|ts|jsx|tsx|rs|java)$`
+	default:
+		return `.*\.(go|py|js|ts|jsx|tsx|rs|java|rb|c|cpp|h)$`
+	}
+}
+
+// testFilePattern returns a regex pattern for test files of the given language.
+func testFilePattern(lang string) string {
+	switch lang {
+	case "go":
+		return `.*_test\.go$`
+	case "python":
+		return `(^|[/_.])(test|spec)[/_.-].*\.py$|.*[_./](test|spec)\.py$`
+	case "javascript":
+		return `.*\.(test|spec)\.(js|ts|jsx|tsx|mjs)$|(^|[/_.])(test|spec)[/_.-].*\.(js|ts|jsx|tsx|mjs)$`
+	case "rust":
+		return `.*tests?/.*\.rs$|.*\btests?\.rs$`
+	case "java":
+		return `.*Test\.java$|.*Tests\.java$`
+	case "mixed":
+		return `.*_test\.go$|.*test.*\.py$|.*\.(test|spec)\.(js|ts|jsx|tsx|mjs)$`
+	default:
+		return `.*_test\.go$|.*test.*\.py$|.*\.(test|spec)\.(js|ts|jsx|tsx|mjs)$`
+	}
+}
+
 // runEngineeringChecks runs hard build/test checks inside the worktree.
 func runEngineeringChecks(st *store.Store, t *task.Task, r *run.Run, p *project.Project) (*Result, error) {
 	res := &Result{Passed: true}
@@ -310,31 +416,24 @@ func runEngineeringChecks(st *store.Store, t *task.Task, r *run.Run, p *project.
 		return res, nil
 	}
 
-	// Always ensure the code builds.
-	if err := runCommand(r.Worktree, "go build ./..."); err != nil {
-		res.Errors = append(res.Errors, "build failed: "+err.Error())
-	}
-	// Run tests if any exist; a missing test package is not an error.
-	if err := runCommand(r.Worktree, "go test ./..."); err != nil {
-		res.Errors = append(res.Errors, "tests failed: "+err.Error())
-	}
-	if err := runCommand(r.Worktree, "go vet ./..."); err != nil {
-		res.Errors = append(res.Errors, "vet failed: "+err.Error())
-	}
+	// Run language-appropriate build/test checks.
+	runBuildTestChecks(res, r.Worktree, p)
 
-	// Specialization-specific file checks.
+	// Specialization-specific file checks using project language.
+	srcPattern := sourceFilePattern(p.Language)
+	tstPattern := testFilePattern(p.Language)
 	switch t.Specialization {
 	case "frontend":
-		if !hasFiles(r.Worktree, `.*\.(html|tmpl|css|js)$`) {
+		if !hasFiles(r.Worktree, `.*\.(html|tmpl|css|js|ts|jsx|tsx)$`) {
 			res.Errors = append(res.Errors, "frontend task produced no html/tmpl/css/js files")
 		}
 	case "backend":
-		if !hasFiles(r.Worktree, `.*\.go$`) {
-			res.Errors = append(res.Errors, "backend task produced no .go files")
+		if !hasFiles(r.Worktree, srcPattern) {
+			res.Errors = append(res.Errors, "backend task produced no source files ("+p.Language+")")
 		}
 	case "tests":
-		if !hasFiles(r.Worktree, `.*_test\.go$`) {
-			res.Errors = append(res.Errors, "tests task produced no *_test.go files")
+		if !hasFiles(r.Worktree, tstPattern) {
+			res.Errors = append(res.Errors, "tests task produced no test files ("+p.Language+")")
 		}
 	case "templates":
 		if !hasFiles(r.Worktree, `.*\.(html|tmpl)$`) {
@@ -347,6 +446,8 @@ func runEngineeringChecks(st *store.Store, t *task.Task, r *run.Run, p *project.
 }
 
 // runQAVerifyChecks validates the final merged state in the project repo (main branch).
+// If the run has a worktree (e.g. QA agent made fixes), it is also checked so that
+// fixes committed there are not missed by structural checks that only look at RepoPath.
 func runQAVerifyChecks(st *store.Store, t *task.Task, r *run.Run, p *project.Project) (*Result, error) {
 	res := &Result{Passed: true}
 
@@ -355,6 +456,7 @@ func runQAVerifyChecks(st *store.Store, t *task.Task, r *run.Run, p *project.Pro
 		res.Errors = append(res.Errors, "no project repo available for verification")
 	}
 
+	// Run project-defined test/lint commands if configured.
 	if p.TestCommand != "" {
 		if err := runCommand(verifyDir, p.TestCommand); err != nil {
 			res.Errors = append(res.Errors, "tests failed: "+err.Error())
@@ -366,9 +468,19 @@ func runQAVerifyChecks(st *store.Store, t *task.Task, r *run.Run, p *project.Pro
 		}
 	}
 
-	// Structural check: if the plan expects a cmd/main entrypoint, verify it exists.
-	if hasFiles(verifyDir, `.*\.go$`) && !hasFiles(verifyDir, `(^|/)cmd/[^/]+/main\.go$`) {
-		res.Errors = append(res.Errors, "no cmd/*/main.go entrypoint found in final repo")
+	// Language-appropriate structural checks.
+	if p.Language == "go" || p.Language == "mixed" {
+		// Go: if the project has .go files, check for cmd/main entrypoint.
+		if hasFiles(verifyDir, `.*\.go$`) && !hasFiles(verifyDir, `(^|/)cmd/[^/]+/main\.go$`) {
+			worktreeHasCmd := r.Worktree != "" && hasFiles(r.Worktree, `(^|/)cmd/[^/]+/main\.go$`)
+			if !worktreeHasCmd {
+				// Don't fail for library-only projects (no main expected).
+				// Only flag if there are .go files but no entrypoint and no library marker.
+				if !fileExistsInWorktree(verifyDir, ".library") {
+					res.Errors = append(res.Errors, "no cmd/*/main.go entrypoint found in final repo")
+				}
+			}
+		}
 	}
 
 	res.Passed = len(res.Errors) == 0

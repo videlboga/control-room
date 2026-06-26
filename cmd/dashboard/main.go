@@ -15,10 +15,6 @@ func main() {
 	if root == "" {
 		root = config.DefaultWorkspace()
 	}
-	if err := dashboard.LoadTemplates(); err != nil {
-		slog.Error("failed to load templates", "err", err)
-		os.Exit(1)
-	}
 	st := store.New(root)
 	port := os.Getenv("PORT")
 	if port == "" {

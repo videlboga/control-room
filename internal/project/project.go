@@ -21,10 +21,65 @@ type Project struct {
 	Docs        []string `json:"docs" yaml:"docs"`
 	DefaultTeam string   `json:"default_team" yaml:"default_team"`
 	Rules       []string `json:"rules" yaml:"rules"`
+	Language    string   `json:"language,omitempty" yaml:"language,omitempty"` // go, python, javascript, mixed, ""
 	TestCommand string   `json:"test_command,omitempty" yaml:"test_command,omitempty"`
 	LintCommand string   `json:"lint_command,omitempty" yaml:"lint_command,omitempty"`
 	BaseCommit  string   `json:"base_commit,omitempty" yaml:"base_commit,omitempty"`
 	CreatedAt   string   `json:"created_at" yaml:"created_at"`
+}
+
+// DetectLanguage scans a repo path for marker files and returns the primary language.
+// Returns "go", "python", "javascript", "mixed", or "" (unknown).
+func DetectLanguage(repoPath string) string {
+	if repoPath == "" {
+		return ""
+	}
+	hasGoMod := fileExists(filepath.Join(repoPath, "go.mod"))
+	hasReqs := fileExists(filepath.Join(repoPath, "requirements.txt")) || fileExists(filepath.Join(repoPath, "pyproject.toml")) || fileExists(filepath.Join(repoPath, "setup.py"))
+	hasPkg := fileExists(filepath.Join(repoPath, "package.json"))
+	hasCargo := fileExists(filepath.Join(repoPath, "Cargo.toml"))
+	hasPom := fileExists(filepath.Join(repoPath, "pom.xml")) || fileExists(filepath.Join(repoPath, "build.gradle")) || fileExists(filepath.Join(repoPath, "build.gradle.kts"))
+
+	count := 0
+	if hasGoMod {
+		count++
+	}
+	if hasReqs {
+		count++
+	}
+	if hasPkg {
+		count++
+	}
+	if hasCargo {
+		count++
+	}
+	if hasPom {
+		count++
+	}
+	if count > 1 {
+		return "mixed"
+	}
+	if hasGoMod {
+		return "go"
+	}
+	if hasReqs {
+		return "python"
+	}
+	if hasPkg {
+		return "javascript"
+	}
+	if hasCargo {
+		return "rust"
+	}
+	if hasPom {
+		return "java"
+	}
+	return ""
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func Create(st *store.Store, p *Project) error {
@@ -33,7 +88,13 @@ func Create(st *store.Store, p *Project) error {
 	}
 	if p.RepoPath != "" {
 		if _, err := os.Stat(p.RepoPath); os.IsNotExist(err) {
-			return errors.New("repo path does not exist: " + p.RepoPath)
+			// Create the directory and initialize a git repo.
+			if err := os.MkdirAll(p.RepoPath, 0o755); err != nil {
+				return fmt.Errorf("cannot create repo path: %w", err)
+			}
+			if err := exec.Command("git", "init", p.RepoPath).Run(); err != nil {
+				return fmt.Errorf("git init failed: %w", err)
+			}
 		}
 	}
 	if p.DocsDir != "" {
@@ -43,6 +104,10 @@ func Create(st *store.Store, p *Project) error {
 	}
 	if p.CreatedAt == "" {
 		p.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	// Auto-detect language if not set.
+	if p.Language == "" && p.RepoPath != "" {
+		p.Language = DetectLanguage(p.RepoPath)
 	}
 	// Ensure the backing repo has a valid HEAD so that git worktrees can branch from it.
 	if p.RepoPath != "" {
@@ -68,15 +133,24 @@ func currentHead(repoPath string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// ensureRepoHasCommit creates an empty initial commit if the repo has no commits yet.
+// ensureRepoHasCommit initializes a git repo if needed and creates an empty initial commit.
 func ensureRepoHasCommit(repoPath string) error {
 	cmd := exec.Command("git", "-C", repoPath, "rev-parse", "--verify", "HEAD")
 	if err := cmd.Run(); err == nil {
-		return nil
+		return nil // already has commits
+	}
+	// Not a git repo or no commits — init if needed
+	if _, err := os.Stat(filepath.Join(repoPath, ".git")); os.IsNotExist(err) {
+		if err := exec.Command("git", "init", repoPath).Run(); err != nil {
+			return fmt.Errorf("git init failed: %w", err)
+		}
 	}
 	_ = exec.Command("git", "-C", repoPath, "config", "user.email", "hw@hermes.local").Run()
 	_ = exec.Command("git", "-C", repoPath, "config", "user.name", "Hermes Workspace").Run()
-	return exec.Command("git", "-C", repoPath, "commit", "--allow-empty", "-m", "chore: initial commit").Run()
+	if err := exec.Command("git", "-C", repoPath, "commit", "--allow-empty", "-m", "chore: initial commit").Run(); err != nil {
+		return fmt.Errorf("git commit failed: %w", err)
+	}
+	return nil
 }
 
 func Get(st *store.Store, id string) (*Project, error) {
