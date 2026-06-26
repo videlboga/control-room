@@ -31,7 +31,7 @@ func NewRootCmd() *cobra.Command {
 	var hermesSource string
 	var stub bool
 	rootCmd := &cobra.Command{
-		Use:   "hw",
+		Use:   "cr",
 		Short: "Hermes Workspace -- lightweight project/team/run orchestrator",
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			if root == "" {

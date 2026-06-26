@@ -357,6 +357,9 @@ func Cancel(st *store.Store, id string) error {
 }
 
 func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team.Team, slot int) {
+	// Ensure concurrency slot is always released, even on early return or panic.
+	defer func() { _ = releaseSlot(st, slot) }()
+
 	if st.StubMode {
 		executeStub(st, r, t, p, te, slot)
 		return
@@ -406,6 +409,11 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 	if hermesFailed {
 		r.Errors++
 		_ = logEvent(st, r, agentName, "error", "hermes", err.Error())
+		// Mark run as failed immediately so the orchestrator and dashboard
+		// can distinguish "agent crashed" from "agent finished".
+		r.Status = "failed"
+		r.EndedAt = time.Now().UTC().Format(time.RFC3339)
+		r.Summary = fmt.Sprintf("Hermes agent failed for task %s: %s", t.ID, err.Error())
 		_ = st.WriteJSON([]string{"runs", r.ID, "run.json"}, r)
 	}
 	_ = logEvent(st, r, agentName, "tool_call", "hermes", out)
@@ -431,6 +439,18 @@ func execute(st *store.Store, r *Run, t *task.Task, p *project.Project, te *team
 				_ = logEvent(st, r, "system", "info", "git", "committed agent changes")
 			}
 		}
+	}
+
+	// If hermes crashed, mark task as pending_review with reject verdict
+	// so the orchestrator can create a redo or escalate — but do NOT mark
+	// it as "done" which would make it look successful in the dashboard.
+	if hermesFailed {
+		t.Status = task.StatusPendingReview
+		t.Verdict = "reject"
+		t.VerdictReason = "hermes agent failed: " + err.Error()
+		_ = task.Update(st, t)
+		_ = releaseSlot(st, slot)
+		return
 	}
 
 	// Update task BEFORE marking run done, so detached watchers do not exit
