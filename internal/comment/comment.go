@@ -11,11 +11,12 @@ import (
 
 	"github.com/google/uuid"
 	"control-room/internal/epic"
+	"control-room/internal/project"
 	"control-room/internal/store"
 	"control-room/internal/task"
 )
 
-// Comment is a timeline entry attached to an epic or task.
+// Comment is a timeline entry attached to any entity (workspace, project, task, run, epic).
 type Comment struct {
 	ID         string `json:"id"`
 	EntityKind string `json:"entity_kind"`
@@ -25,10 +26,35 @@ type Comment struct {
 	CreatedAt  string `json:"created_at"`
 }
 
-// resolveEntityID converts a DisplayID to an internal ID for tasks and epics.
+// resolveEntityID converts a DisplayID to an internal ID for any supported kind.
+// For "workspace" and "project" kinds, the ID is used as-is (no lookup needed).
 func resolveEntityID(st *store.Store, kind, id string) (string, error) {
 	if id == "" {
 		return "", errors.New("entity id is required")
+	}
+	// workspace has a single instance, use fixed ID
+	if kind == "workspace" {
+		return "workspace", nil
+	}
+	// project: accept as-is or resolve by ID
+	if kind == "project" {
+		if strings.HasPrefix(id, "proj_") {
+			return id, nil
+		}
+		all, err := project.List(st)
+		if err != nil {
+			return "", err
+		}
+		for _, p := range all {
+			if p.ID == id {
+				return p.ID, nil
+			}
+		}
+		return "", fmt.Errorf("project not found: %s", id)
+	}
+	// run: accept as-is
+	if kind == "run" {
+		return id, nil
 	}
 	if strings.HasPrefix(id, kind+"_") || strings.HasPrefix(id, "comment_") {
 		return id, nil

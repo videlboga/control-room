@@ -1,4 +1,4 @@
-import { writable, derived } from 'svelte/store'
+import { writable, derived, get } from 'svelte/store'
 
 // ─── WebSocket connection ───
 export const wsConnected = writable(false)
@@ -6,6 +6,7 @@ export const wsMessages = writable([])
 
 let ws = null
 let reconnectTimer = null
+let pendingSends = []  // messages queued before WS is open
 
 export function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
@@ -14,6 +15,11 @@ export function connectWS() {
   ws.onopen = () => {
     wsConnected.set(true)
     if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null }
+    // Flush pending messages that were queued before WS was open
+    for (const msg of pendingSends) {
+      ws.send(JSON.stringify(msg))
+    }
+    pendingSends = []
   }
 
   ws.onmessage = (ev) => {
@@ -38,6 +44,9 @@ export function connectWS() {
 export function sendWS(msg) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(msg))
+  } else {
+    // Queue message until WS is open
+    pendingSends.push(msg)
   }
 }
 
@@ -50,11 +59,22 @@ export const agents = writable([])
 export const runLogs = writable({}) // { runId: [lines] }
 export const runEvents = writable({}) // { runId: [events] }
 
+// ─── Chat-centric stores (new concept) ───
+export const tree = writable(null)           // workspace → projects → tasks tree
+export const livePreviews = writable([])     // streaming chat previews
+export const currentChat = writable({        // currently selected chat
+  type: 'workspace',  // 'workspace' | 'project' | 'task' | 'run'
+  id: 'workspace',
+  title: 'Control Room',
+})
+export const conversation = writable([])     // messages for current chat (comments + events)
+export const controllerMessages = writable([]) // DEPRECATED — use agentStreams instead
+export const agentStreams = writable({})     // map: nodeKey → messages[] (live agent output per node)
+
 function handleMessage(msg) {
   switch (msg.type) {
     case 'snapshot':
       activeRuns.set(msg.data.active_runs || [])
-      // task_stats comes as [{status, count}, ...] — convert to {status: count}
       if (Array.isArray(msg.data.task_stats)) {
         const statsObj = {}
         for (const s of msg.data.task_stats) statsObj[s.status] = s.count
@@ -63,7 +83,6 @@ function handleMessage(msg) {
         taskStats.set(msg.data.task_stats || {})
       }
       projects.set(msg.data.projects || [])
-      // Load initial log lines for each active run
       if (msg.data.initial_logs) {
         runLogs.update(logs => {
           const updated = { ...logs }
@@ -85,6 +104,8 @@ function handleMessage(msg) {
         }
         return runs
       })
+      // Also update live previews
+      refreshLivePreviews()
       break
     case 'log_line':
       runLogs.update(logs => {
@@ -94,6 +115,25 @@ function handleMessage(msg) {
         if (logs[id].length > 50) logs[id] = logs[id].slice(-50)
         return { ...logs }
       })
+      // Also append to conversation if this is a task chat
+      // and the run belongs to the current task (match by run_id from live previews)
+      currentChat.update(cc => {
+        if (cc.type === 'task') {
+          // Match: check if this run_id belongs to the current task
+          // We use livePreviews which has task_id → run_id mapping
+          const previews = get(livePreviews)
+          const preview = previews.find(p => p.run_id === msg.data.run_id)
+          if (preview && preview.id === cc.id) {
+            conversation.update(msgs => [...msgs, {
+              role: 'log',
+              body: msg.data.line,
+              timestamp: msg.data.timestamp || '',
+              type: 'log_line',
+            }])
+          }
+        }
+        return cc
+      })
       break
     case 'event':
       runEvents.update(events => {
@@ -102,7 +142,6 @@ function handleMessage(msg) {
         events[id].push(msg.data)
         return { ...events }
       })
-      // Update tool_use_count
       if (msg.data.type === 'tool_call') {
         activeRuns.update(runs => {
           const idx = runs.findIndex(r => r.id === msg.data.run_id)
@@ -124,11 +163,69 @@ function handleMessage(msg) {
       break
     case 'run_done':
       activeRuns.update(runs => runs.filter(r => r.id !== msg.data.id))
+      refreshLivePreviews()
       break
     case 'task_stats':
       taskStats.set(msg.data)
       break
+    case 'new_comment':
+      // Watcher detected a new comment file change.
+      // Data has entity_kind + entity_id but not the comment itself.
+      // Reload the conversation to get the new comment.
+      if (msg.data && msg.data.entity_kind && msg.data.entity_id) {
+        // Check if this matches the currently active conversation
+        currentChat.update(cc => {
+          if (cc.type === msg.data.entity_kind && cc.id === msg.data.entity_id) {
+            // Reload conversation to get the new comment
+            loadConversation(cc.type, cc.id)
+          }
+          return cc
+        })
+      }
+      break
+    case 'tree_update':
+      // Watcher detected a task/project/run change — reload tree
+      loadTree()
+      // Also refresh live previews
+      loadLivePreviews()
+      break
+    // Controller/project agent streaming — messages have text at top level.
+    // Route to the correct agentStream based on which agent is active.
+    case 'output':
+      appendToActiveStream(msg, 'agent')
+      break
+    case 'error':
+      appendToActiveStream(msg, 'system')
+      break
+    case 'user_message':
+      appendToActiveStream(msg, 'human')
+      break
+    case 'started':
+      appendToActiveStream(msg, 'system', `Agent started (PID: ${msg.pid || msg.data?.pid || '?'})`)
+      break
+    case 'ended':
+      appendToActiveStream(msg, 'system', `Agent ended (exit: ${msg.exit || msg.data?.exit || '?'})`)
+      break
+    // Project agent streaming — same format as controller but on "project:{id}" channel.
+    // The output/started/ended/error types are the same, so they're already handled above.
+    // The only difference: project agent messages arrive on a different WS channel,
+    // but handleMessage doesn't filter by channel — it processes all messages.
+    // The channel filtering is done by the Hub (only delivers to subscribed clients).
   }
+}
+
+// ─── Live previews refresh ───
+let previewTimer = null
+function refreshLivePreviews() {
+  // Debounce
+  if (previewTimer) return
+  previewTimer = setTimeout(async () => {
+    previewTimer = null
+    try {
+      const data = await apiGet('/live')
+      livePreviews.set(data.previews || [])
+    } catch (e) { /* ignore */ }
+  }, 500)
 }
 
 // ─── API client ───
@@ -160,23 +257,137 @@ export async function apiPatch(path, body) {
   return r.json()
 }
 
-// ─── Avatar logic ───
-export function getToolTier(pct) {
-  if (pct < 30) return 'low'
-  if (pct < 70) return 'mid'
-  return 'high'
+// ─── Channel subscription helpers ───
+
+// Exported for ChatView to append human/system messages directly
+export function appendToStream(nodeKey, msg) {
+  agentStreams.update(streams => {
+    if (!streams[nodeKey]) streams[nodeKey] = []
+    streams[nodeKey] = [...streams[nodeKey], msg]
+    return { ...streams }
+  })
 }
 
-export function getRedoTier(redo) {
-  if (redo <= 3) return 'low'
-  if (redo <= 7) return 'mid'
-  return 'high'
+// Determine which node key an agent message belongs to.
+// Messages from controller have no project_id → workspace.
+// Messages from project agent have project_id → project:{id}.
+function appendToActiveStream(msg, role, overrideBody) {
+  const cc = get(currentChat)
+  // Determine node key: workspace or project:{id}
+  // If msg has project_id → project stream
+  // Otherwise → current chat's stream (workspace or project)
+  let nodeKey
+  if (msg.project_id) {
+    nodeKey = 'project:' + msg.project_id
+  } else if (cc.type === 'workspace') {
+    nodeKey = 'workspace'
+  } else if (cc.type === 'project') {
+    nodeKey = 'project:' + cc.id
+  } else {
+    nodeKey = 'workspace' // fallback
+  }
+
+  const body = overrideBody || msg.text || (msg.data?.text) || ''
+  const ts = msg.ts || (msg.data?.ts) || ''
+
+  agentStreams.update(streams => {
+    if (!streams[nodeKey]) streams[nodeKey] = []
+    streams[nodeKey] = [...streams[nodeKey], { role, body, timestamp: ts, type: msg.type }]
+    return { ...streams }
+  })
 }
 
-export function getAvatarKey(toolPct, redo) {
-  const t = getToolTier(toolPct)
-  const r = getRedoTier(redo)
-  return `${t}_${r}` // e.g. "low_mid"
+// Subscribe to a conversation channel to get new_comment pushes
+export function subscribeConversation(type, id) {
+  sendWS({ action: 'subscribe', channel: `conversation:${type}:${id}` })
+}
+
+export function unsubscribeConversation(type, id) {
+  sendWS({ action: 'unsubscribe', channel: `conversation:${type}:${id}` })
+}
+
+// Subscribe to a run channel to get log_line + event pushes
+export function subscribeRun(runId) {
+  if (runId) sendWS({ action: 'subscribe', channel: `run:${runId}` })
+}
+
+export function unsubscribeRun(runId) {
+  if (runId) sendWS({ action: 'unsubscribe', channel: `run:${runId}` })
+}
+
+// Subscribe to tree channel for streaming status updates
+export function subscribeTree() {
+  sendWS({ action: 'subscribe', channel: 'tree' })
+}
+
+// Subscribe to "runs" channel — receives all run_update, log_line, run_done events.
+// The handler in handleMessage filters by currentChat to decide what to show.
+export function subscribeRuns() {
+  sendWS({ action: 'subscribe', channel: 'runs' })
+}
+
+// ─── Chat helpers ───
+export async function loadConversation(type, id) {
+  try {
+    const data = await apiGet(`/conversations/${type}/${id}`)
+    conversation.set(data.messages || [])
+    currentChat.set({ type, id })
+  } catch (e) {
+    console.error('loadConversation:', e)
+    conversation.set([])
+  }
+}
+
+export async function loadTree() {
+  try {
+    const data = await apiGet('/tree')
+    tree.set(data)
+  } catch (e) {
+    console.error('loadTree:', e)
+  }
+}
+
+export async function sendChatMessage(type, id, body, author = 'human') {
+  try {
+    const c = await apiPost(`/conversations/${type}/${id}`, { author, body })
+    // Also append locally for instant feedback
+    conversation.update(msgs => [...msgs, {
+      id: c.id,
+      role: author,
+      author,
+      body,
+      timestamp: c.created_at,
+    }])
+    return c
+  } catch (e) {
+    console.error('sendChatMessage:', e)
+    return null
+  }
+}
+
+export async function loadLivePreviews() {
+  try {
+    const data = await apiGet('/live')
+    livePreviews.set(data.previews || [])
+  } catch (e) { /* ignore */ }
+}
+
+export async function loadControllerHistory() {
+  try {
+    const data = await apiGet('/controller/history')
+    const msgs = (data.messages || []).map(m => ({
+      role: m.role || 'agent',
+      body: m.body || '',
+      timestamp: m.timestamp || '',
+      type: m.type || 'output',
+    }))
+    agentStreams.update(streams => {
+      streams['workspace'] = msgs
+      return { ...streams }
+    })
+  } catch (e) {
+    console.error('loadControllerHistory:', e)
+  }
 }
 
 // ─── Format helpers ───

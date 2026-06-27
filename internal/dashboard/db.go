@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -165,6 +166,18 @@ func (d *DB) createSchema() error {
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL DEFAULT ''
 		)`,
+		// Memory layers — stores raw, narrative, and policy entries per node.
+		`CREATE TABLE IF NOT EXISTS memory_entries (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			node_type  TEXT NOT NULL,             -- 'workspace' | 'project' | 'task' | 'run'
+			node_id    TEXT NOT NULL,             -- entity ID (or 'workspace' for workspace)
+			layer      TEXT NOT NULL,             -- 'raw' | 'narrative' | 'policy'
+			content    TEXT NOT NULL,             -- the memory content (text or JSON)
+			source     TEXT NOT NULL DEFAULT '',  -- who wrote it: 'system' | 'agent' | 'human'
+			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_memory_node ON memory_entries(node_type, node_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_memory_layer ON memory_entries(layer)`,
 		// Indexes — the hot dashboard queries filter on status/project/run.
 		`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id)`,
@@ -742,4 +755,100 @@ func jsonString(v any) string {
 		return "[]"
 	}
 	return string(b)
+}
+
+// ---------------------------------------------------------------------------
+// Memory layers
+// ---------------------------------------------------------------------------
+
+// MemoryEntry is a single memory record for a node.
+type MemoryEntry struct {
+	ID        int64  `json:"id"`
+	NodeType  string `json:"node_type"`
+	NodeID    string `json:"node_id"`
+	Layer     string `json:"layer"` // 'raw' | 'narrative' | 'policy'
+	Content   string `json:"content"`
+	Source    string `json:"source"`
+	CreatedAt string `json:"created_at"`
+}
+
+// AddMemory inserts a memory entry.
+func (d *DB) AddMemory(nodeType, nodeID, layer, content, source string) (MemoryEntry, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if source == "" {
+		source = "system"
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := d.db.Exec(
+		`INSERT INTO memory_entries (node_type, node_id, layer, content, source, created_at)
+		 VALUES (?,?,?,?,?,?)`,
+		nodeType, nodeID, layer, content, source, now)
+	if err != nil {
+		return MemoryEntry{}, err
+	}
+	id, _ := res.LastInsertId()
+	return MemoryEntry{
+		ID:        id,
+		NodeType:  nodeType,
+		NodeID:    nodeID,
+		Layer:     layer,
+		Content:   content,
+		Source:    source,
+		CreatedAt: now,
+	}, nil
+}
+
+// GetMemory returns memory entries for a node, optionally filtered by layer.
+// If layer is empty, returns all layers. Newest first.
+func (d *DB) GetMemory(nodeType, nodeID, layer string, limit int) ([]MemoryEntry, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	q := `SELECT id, node_type, node_id, layer, content, source, created_at
+	      FROM memory_entries WHERE node_type = ? AND node_id = ?`
+	args := []any{nodeType, nodeID}
+	if layer != "" {
+		q += " AND layer = ?"
+		args = append(args, layer)
+	}
+	q += " ORDER BY id DESC LIMIT ?"
+	args = append(args, limit)
+	rows, err := d.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MemoryEntry
+	for rows.Next() {
+		var e MemoryEntry
+		if err := rows.Scan(&e.ID, &e.NodeType, &e.NodeID, &e.Layer, &e.Content, &e.Source, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// GetLatestNarrative returns the most recent narrative entry for a node,
+// or empty string if none exists.
+func (d *DB) GetLatestNarrative(nodeType, nodeID string) (string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var content string
+	err := d.db.QueryRow(
+		`SELECT content FROM memory_entries
+		 WHERE node_type = ? AND node_id = ? AND layer = 'narrative'
+		 ORDER BY id DESC LIMIT 1`, nodeType, nodeID).Scan(&content)
+	if err != nil {
+		return "", nil // no narrative yet is not an error
+	}
+	return content, nil
+}
+
+// GetPolicy returns all policy entries for a node (decisions, constraints).
+func (d *DB) GetPolicy(nodeType, nodeID string) ([]MemoryEntry, error) {
+	return d.GetMemory(nodeType, nodeID, "policy", 100)
 }

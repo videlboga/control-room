@@ -5,6 +5,7 @@ const items = [
   { key: 'runs', label: 'Runs', badge: true },
   { key: 'board', label: 'Board' },
   { key: 'tasks', label: 'Tasks' },
+  { key: 'controller', label: 'Controller' },
   { key: 'settings', label: 'Settings' },
 ]
 </script>
@@ -33,6 +34,8 @@ const items = [
             <path d="M3 4h10M3 8h10M3 12h7"/><circle cx="13" cy="12" r="1.5" fill="currentColor"/>
           {:else if item.key === 'settings'}
             <circle cx="8" cy="8" r="2.5"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M3.2 12.8l1.4-1.4M11.4 4.6l1.4-1.4"/>
+          {:else if item.key === 'controller'}
+            <circle cx="8" cy="8" r="5.5"/><circle cx="8" cy="8" r="2" fill="currentColor"/>
           {/if}
         </svg>
         {item.label}

@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+
+	"control-room/internal/run"
 )
 
 // Watcher monitors the control-room filesystem store for changes to JSON files
@@ -52,7 +54,7 @@ func NewWatcher(db *DB, ds *DashboardStore, hub *Hub) (*Watcher, error) {
 // Start adds the watched directories and launches the event loop goroutine.
 // Missing directories are created first so a fresh workspace still works.
 func (w *Watcher) Start() error {
-	dirs := []string{"tasks", "runs", "epics", "projects", "teams"}
+	dirs := []string{"tasks", "runs", "epics", "projects", "teams", "comments"}
 	for _, d := range dirs {
 		p := filepath.Join(w.root, d)
 		_ = os.MkdirAll(p, 0o755)
@@ -60,6 +62,8 @@ func (w *Watcher) Start() error {
 			slog.Warn("watcher add dir", "dir", p, "err", err)
 		}
 	}
+	// Also watch comments subdirectories (workspace, project, task, run, epic)
+	w.watchCommentDirs()
 	// Also watch the runs subdirectories for activity.log changes.
 	w.watchRunDirs()
 	go w.loop()
@@ -79,6 +83,26 @@ func (w *Watcher) watchRunDirs() {
 		p := filepath.Join(runsDir, e.Name())
 		if err := w.w.Add(p); err != nil {
 			slog.Warn("watcher add run dir", "dir", p, "err", err)
+		}
+	}
+}
+
+// watchCommentDirs adds all comment subdirectories to the fsnotify watcher.
+// Comments are stored as comments/{kind}/{entityID}.jsonl — we watch each
+// kind subdirectory so new comments trigger a conversation WS broadcast.
+func (w *Watcher) watchCommentDirs() {
+	commentsDir := filepath.Join(w.root, "comments")
+	entries, err := os.ReadDir(commentsDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		p := filepath.Join(commentsDir, e.Name())
+		if err := w.w.Add(p); err != nil {
+			slog.Warn("watcher add comment dir", "dir", p, "err", err)
 		}
 	}
 }
@@ -153,6 +177,7 @@ func (w *Watcher) handle(path string) {
 			return
 		}
 		w.hub.BroadcastMessage("board", WSMessage{Channel: "board", Type: "task_update", At: time.Now()})
+		w.hub.BroadcastMessage("tree", map[string]any{"type": "tree_update", "data": map[string]any{"node_type": "task"}})
 	case "epics":
 		if !strings.HasSuffix(base, ".json") {
 			return
@@ -171,6 +196,7 @@ func (w *Watcher) handle(path string) {
 			return
 		}
 		w.hub.BroadcastMessage("board", WSMessage{Channel: "board", Type: "project_update", At: time.Now()})
+		w.hub.BroadcastMessage("tree", map[string]any{"type": "tree_update", "data": map[string]any{"node_type": "project"}})
 	case "teams":
 		if !strings.HasSuffix(base, ".json") {
 			return
@@ -180,6 +206,27 @@ func (w *Watcher) handle(path string) {
 			return
 		}
 		w.hub.BroadcastMessage("board", WSMessage{Channel: "board", Type: "team_update", At: time.Now()})
+	case "comments":
+		// Comments are stored as comments/{kind}/{entityID}.jsonl
+		// path = .../comments/{kind}/{entityID}.jsonl
+		// parts = ["comments", kind, "entityID.jsonl"]
+		if len(parts) < 3 {
+			// A new comment kind directory appeared — watch it.
+			if isDir(path) {
+				_ = w.w.Add(path)
+			}
+			return
+		}
+		kind := parts[1]
+		entityID := strings.TrimSuffix(base, ".jsonl")
+		// Broadcast to the conversation channel so subscribed clients update.
+		w.hub.BroadcastMessage("conversation:"+kind+":"+entityID, map[string]any{
+			"type": "new_comment",
+			"data": map[string]any{
+				"entity_kind": kind,
+				"entity_id":   entityID,
+			},
+		})
 	case "runs":
 		if len(parts) < 3 {
 			// A new run directory may have appeared — watch it.
@@ -197,6 +244,7 @@ func (w *Watcher) handle(path string) {
 				return
 			}
 			w.hub.BroadcastMessage("runs", WSMessage{Channel: "runs", Type: "run_update", At: time.Now()})
+			w.hub.BroadcastMessage("tree", map[string]any{"type": "tree_update", "data": map[string]any{"node_type": "run"}})
 			rn, err := w.store.GetRun(runID)
 			if err == nil {
 				w.hub.BroadcastMessage("run:"+runID, WSMessage{Channel: "run:" + runID, Type: "run_update", Data: jsonRaw(rn), At: time.Now()})
@@ -234,6 +282,11 @@ func (w *Watcher) handle(path string) {
 					"type": "run_update",
 					"data": runData,
 				})
+
+				// Auto-write raw memory when run completes.
+				if rn.Status == "done" || rn.Status == "failed" {
+					w.writeRawMemory(rn, tc)
+				}
 			}
 		case "activity.log":
 			lines := w.tailActivityLog(runID, path)
@@ -318,4 +371,41 @@ func jsonRaw(v any) json.RawMessage {
 		return json.RawMessage(`null`)
 	}
 	return b
+}
+
+// writeRawMemory writes a raw memory entry for a completed run.
+// This captures the run summary, tool count, and verdict as the base layer
+// for the memory pipeline (raw → narrative → briefing).
+func (w *Watcher) writeRawMemory(rn *run.Run, toolCount int) {
+	if w.db == nil {
+		return
+	}
+	// Build a compact summary of the run
+	raw := map[string]any{
+		"run_id":         rn.ID,
+		"task_id":        rn.TaskID,
+		"project_id":     rn.ProjectID,
+		"status":         rn.Status,
+		"agent":          rn.Agent,
+		"step":           rn.Step,
+		"summary":        rn.Summary,
+		"tool_use_count": toolCount,
+		"started_at":     rn.StartedAt,
+		"ended_at":       rn.EndedAt,
+	}
+	content, err := json.Marshal(raw)
+	if err != nil {
+		slog.Warn("writeRawMemory marshal", "run", rn.ID, "err", err)
+		return
+	}
+	// Write to both task and project nodes
+	if _, err := w.db.AddMemory("task", rn.TaskID, "raw", string(content), "system"); err != nil {
+		slog.Warn("writeRawMemory task", "run", rn.ID, "err", err)
+	}
+	// Also write to project node if we can find the project ID
+	if rn.ProjectID != "" {
+		if _, err := w.db.AddMemory("project", rn.ProjectID, "raw", string(content), "system"); err != nil {
+			slog.Warn("writeRawMemory project", "run", rn.ID, "err", err)
+		}
+	}
 }

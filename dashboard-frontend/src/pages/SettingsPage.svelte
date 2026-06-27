@@ -19,6 +19,11 @@ let newEpic = $state({ title: '', description: '', project_id: '', team_id: '' }
 let epicError = $state('')
 let launchStatus = $state('')
 
+// Controller
+let controllerEpicId = $state('')
+let controllerPrompt = $state('')
+let controllerStatus = $state('')
+
 async function load() {
   try {
     teams = await apiGet('/agents')
@@ -71,13 +76,28 @@ async function createEpicAndLaunch() {
       project_id: newEpic.project_id,
     })
     launchStatus = `Epic created: ${epic.id}. Launching orchestrator…`
-    // Launch orchestrator
     const res = await apiPost('/orchestrate', { epic_id: epic.id })
     launchStatus = `Epic ${epic.id} launched (PID: ${res.pid})`
     showNewEpic = false
     newEpic = { title: '', description: '', project_id: '', team_id: '' }
     await load()
   } catch(e) { epicError = e.message }
+}
+
+async function launchController() {
+  controllerStatus = ''
+  if (!controllerEpicId) {
+    controllerStatus = 'Select an epic first'
+    return
+  }
+  try {
+    const res = await apiPost('/controller/launch', {
+      epic_id: controllerEpicId,
+      prompt: controllerPrompt,
+    })
+    controllerStatus = `Controller started (PID: ${res.pid})`
+    controllerPrompt = ''
+  } catch(e) { controllerStatus = 'Error: ' + e.message }
 }
 </script>
 
@@ -261,5 +281,8 @@ async function createEpicAndLaunch() {
 .form-btn:hover { background: var(--accent-hover); }
 .form-error { font-size: 13px; color: var(--danger); margin-bottom: 10px; }
 .form-success { font-size: 13px; color: var(--success-bright); margin-bottom: 10px; }
+.controller-info { font-size: 13px; color: var(--text-tertiary); margin-bottom: 14px; line-height: 1.5; }
+.controller-btn { background: rgba(245,166,35,0.15); color: var(--warning); border: 1px solid rgba(245,166,35,0.3); }
+.controller-btn:hover { background: rgba(245,166,35,0.25); }
 .optional { font-size: 11px; font-weight: 400; color: var(--text-quaternary); }
 </style>

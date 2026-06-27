@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"control-room/internal/epic"
 	"control-room/internal/project"
@@ -100,6 +101,25 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("/api/v1/runs/{id}/redo", s.apiRunRedo)
 	mux.HandleFunc("/api/v1/events", s.apiEventsLegacy) // legacy SSE shim
 	mux.HandleFunc("/api/v1/orchestrate", s.apiOrchestrate)
+	mux.HandleFunc("/api/v1/controller/launch", s.apiControllerLaunch)
+	mux.HandleFunc("/api/v1/controller/send", s.apiControllerSend)
+	mux.HandleFunc("/api/v1/controller/stop", s.apiControllerStop)
+	mux.HandleFunc("/api/v1/controller/status", s.apiControllerStatus)
+
+	// Controller session logs (history across page refreshes)
+	mux.HandleFunc("/api/v1/controller/history", s.apiControllerHistory)
+
+	// Chat-centric API (new concept: workspace → projects → tasks tree + conversations)
+	mux.HandleFunc("/api/v1/tree", s.apiTree)
+	mux.HandleFunc("/api/v1/conversations/", s.apiConversation)
+	mux.HandleFunc("/api/v1/live", s.apiLivePreviews)
+	mux.HandleFunc("/api/v1/memory/", s.apiMemory)
+
+	// Project agent API (per-project interactive agent sessions)
+	mux.HandleFunc("/api/v1/project-agent/", s.apiProjectAgent)
+
+	// Context Compiler
+	mux.HandleFunc("/api/v1/context/", s.apiContext)
 
 	// Static SPA — catch-all, must be registered last.
 	mux.HandleFunc("/", s.spaHandler)
@@ -881,4 +901,127 @@ func (s *Server) apiOrchestrate(w http.ResponseWriter, r *http.Request) {
 		"epic_id": req.EpicID,
 		"pid":     cmd.Process.Pid,
 	})
+}
+
+// apiControllerLaunch launches the controller agent with streaming output.
+// POST /api/v1/controller/launch { "epic_id": "epic_xxx (optional)", "prompt": "instruction" }
+// epic_id is optional — without it, the prompt is used directly.
+// Context is compiled from workspace memory before launching.
+func (s *Server) apiControllerLaunch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		EpicID string `json:"epic_id"`
+		Prompt string `json:"prompt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.EpicID == "" && req.Prompt == "" {
+		jsonError(w, "either epic_id or prompt is required", http.StatusBadRequest)
+		return
+	}
+
+	// Compile workspace context
+	compiled, ctxErr := s.CompileContext("workspace", "workspace")
+	var fullPrompt string
+	if req.EpicID != "" {
+		fullPrompt = fmt.Sprintf("Manage Control Room epic %s.", req.EpicID)
+		if req.Prompt != "" {
+			fullPrompt += " " + req.Prompt
+		}
+	} else {
+		fullPrompt = req.Prompt
+	}
+	if ctxErr == nil && compiled != nil {
+		fullPrompt += fmt.Sprintf("\n\n## Контекст workspace\n\n**Состояние:** %s\n", compiled.CurrentState)
+		if compiled.Narrative != "" {
+			fullPrompt += "\n### Narrative\n" + compiled.Narrative + "\n"
+		}
+		if compiled.Policy != "" {
+			fullPrompt += "\n### Policy\n" + compiled.Policy + "\n"
+		}
+		if len(compiled.OpenTasks) > 0 {
+			fullPrompt += fmt.Sprintf("\n### Открытые задачи (%d)\n", len(compiled.OpenTasks))
+			for _, t := range compiled.OpenTasks {
+				fullPrompt += fmt.Sprintf("- [%s] %s (redo: %d)\n", t.Status, t.Title, t.RedoIndex)
+			}
+		}
+	}
+	fullPrompt += " Check task statuses with cr CLI at /home/cyberkitty/Projects/control-room/cr. Reopen failed tasks, restart orchestrator, clean up zombies. Report what you did."
+
+	cs, err := LaunchControllerWithPrompt(s.hub, req.EpicID, fullPrompt, s.store.Root)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	jsonResponse(w, map[string]any{
+		"status":  "controller_started",
+		"id":      cs.id,
+		"epic_id": req.EpicID,
+		"pid":     cs.cmd.Process.Pid,
+	})
+}
+
+// apiControllerSend sends a follow-up message to the running controller.
+// POST /api/v1/controller/send { "message": "..." }
+func (s *Server) apiControllerSend(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Message == "" {
+		jsonError(w, "message is required", http.StatusBadRequest)
+		return
+	}
+
+	// Broadcast the user message to WS channel.
+	s.hub.BroadcastMessage("controller", map[string]any{
+		"type": "user_message",
+		"text": req.Message,
+		"ts":   time.Now().UTC().Format(time.RFC3339),
+	})
+
+	if err := SendToController(s.hub, req.Message); err != nil {
+		jsonError(w, err.Error(), http.StatusConflict)
+		return
+	}
+
+	jsonResponse(w, map[string]any{"status": "sent"})
+}
+
+// apiControllerStop kills the running controller.
+// POST /api/v1/controller/stop
+func (s *Server) apiControllerStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := StopController(); err != nil {
+		jsonError(w, err.Error(), http.StatusConflict)
+		return
+	}
+	s.hub.BroadcastMessage("controller", map[string]any{"type": "stopped"})
+	jsonResponse(w, map[string]any{"status": "stopped"})
+}
+
+// apiControllerStatus returns current controller state.
+// GET /api/v1/controller/status
+func (s *Server) apiControllerStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	jsonResponse(w, ControllerStatus())
 }
