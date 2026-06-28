@@ -2,7 +2,6 @@ package dashboard
 
 import (
 	"bufio"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -18,16 +17,16 @@ import (
 
 // ControllerSession manages a running hermes controller agent process.
 type ControllerSession struct {
-	mu        sync.Mutex
-	id        string
-	cmd       *exec.Cmd
-	stdout    io.Reader
-	stderr    io.Reader
-	sessionID string // hermes session id for --resume
-	hub       *Hub
-	cancel    context.CancelFunc
-	done      chan struct{}
-	logFile   *os.File // session log file for persistence
+	mu           sync.Mutex
+	id           string
+	cmd          *exec.Cmd
+	stdout       io.Reader
+	stderr       io.Reader
+	sessionID    string // hermes session id for --resume
+	hub          *Hub
+	done         chan struct{}
+	logFile      *os.File  // session log file for persistence
+	sessionReader *SessionReader // polls state.db for structured messages
 }
 
 var (
@@ -89,17 +88,14 @@ func startControllerSession(hub *Hub, cmd *exec.Cmd, epicID string) (*Controller
 		slog.Warn("controller log file", "err", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	_ = ctx
 	cs := &ControllerSession{
-		id:      fmt.Sprintf("ctrl_%d", time.Now().Unix()),
-		cmd:     cmd,
-		stdout:  stdoutPipe,
-		stderr:  stderrPipe,
-		hub:     hub,
-		cancel:  cancel,
-		done:    make(chan struct{}),
-		logFile: logFile,
+		id:        fmt.Sprintf("ctrl_%d", time.Now().Unix()),
+		cmd:       cmd,
+		stdout:    stdoutPipe,
+		stderr:    stderrPipe,
+		hub:       hub,
+		done:      make(chan struct{}),
+		logFile:   logFile,
 	}
 
 	// Broadcast launch event.
@@ -110,10 +106,21 @@ func startControllerSession(hub *Hub, cmd *exec.Cmd, epicID string) (*Controller
 		"pid":     cmd.Process.Pid,
 	})
 
-	// Stream stdout to WS channel "controller".
+	// Stream stdout to WS channel "controller" (for session ID extraction + fallback).
 	go cs.streamOutput(stdoutPipe, "output", epicID)
 	// Stream stderr to WS channel "controller" (for errors/debug).
 	go cs.streamOutput(stderrPipe, "error", epicID)
+
+	// Start session reader — auto-detects latest session from state.db.
+	// Polls every 500ms for new structured messages.
+	reader, err := NewSessionReader("hw_agent_controller", "controller", hub)
+	if err == nil {
+		reader.Start("") // empty = auto-detect latest session
+		cs.mu.Lock()
+		cs.sessionReader = reader
+		cs.mu.Unlock()
+		slog.Info("controller session reader started (auto-detect)")
+	}
 
 	// Wait for process to finish.
 	go func() {
@@ -122,6 +129,13 @@ func startControllerSession(hub *Hub, cmd *exec.Cmd, epicID string) (*Controller
 		if cs.logFile != nil {
 			_ = cs.logFile.Close()
 		}
+		// Stop session reader
+		cs.mu.Lock()
+		if cs.sessionReader != nil {
+			cs.sessionReader.Stop()
+			cs.sessionReader = nil
+		}
+		cs.mu.Unlock()
 		hub.BroadcastMessage("controller", map[string]any{
 			"type":  "ended",
 			"id":    cs.id,
@@ -406,7 +420,6 @@ func StopController() error {
 	if controllerSession == nil {
 		return fmt.Errorf("no controller running")
 	}
-	controllerSession.cancel()
 	if controllerSession.cmd != nil && controllerSession.cmd.Process != nil {
 		controllerSession.cmd.Process.Kill()
 	}

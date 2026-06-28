@@ -109,6 +109,9 @@ func (s *Server) routes() http.Handler {
 	// Controller session logs (history across page refreshes)
 	mux.HandleFunc("/api/v1/controller/history", s.apiControllerHistory)
 
+	// Session reader — structured message history from state.db
+	mux.HandleFunc("/api/v1/session/", s.apiSession)
+
 	// Chat-centric API (new concept: workspace → projects → tasks tree + conversations)
 	mux.HandleFunc("/api/v1/tree", s.apiTree)
 	mux.HandleFunc("/api/v1/conversations/", s.apiConversation)
