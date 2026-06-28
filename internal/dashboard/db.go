@@ -832,7 +832,18 @@ func (d *DB) GetMemory(nodeType, nodeID, layer string, limit int) ([]MemoryEntry
 	return out, nil
 }
 
-// GetLatestNarrative returns the most recent narrative entry for a node,
+// GetEvidence returns evidence-layer entries for a node.
+func (db *DB) GetEvidence(nodeType, nodeID string) ([]MemoryEntry, error) {
+	return db.GetMemory(nodeType, nodeID, "evidence", 20)
+}
+
+// AddEvidence writes an evidence entry.
+func (db *DB) AddEvidence(nodeType, nodeID, content, source string) error {
+	_, err := db.AddMemory(nodeType, nodeID, "evidence", content, source)
+	return err
+}
+
+// GetLatestNarrative returns the most recent narrative entry for a node.
 // or empty string if none exists.
 func (d *DB) GetLatestNarrative(nodeType, nodeID string) (string, error) {
 	d.mu.Lock()

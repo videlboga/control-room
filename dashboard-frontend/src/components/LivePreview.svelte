@@ -21,6 +21,9 @@ async function selectPreview(preview) {
   } else if (preview.type === 'workspace') {
     await loadConversation('workspace', 'workspace')
     onSelect?.({ type: 'workspace', id: 'workspace', title: 'Control Room' })
+  } else if (preview.type === 'project') {
+    await loadConversation('project', preview.id)
+    onSelect?.({ type: 'project', id: preview.id, title: preview.title })
   }
 }
 

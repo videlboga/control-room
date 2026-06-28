@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -27,11 +28,13 @@ type ProjectSession struct {
 	sessionID string // hermes session id for --resume
 	hub       *Hub
 	done      chan struct{}
+	logFile   *os.File // session log file for persistence
+	idleSince time.Time // when the process ended (for idle timeout)
 }
 
 var (
 	projectMu        sync.Mutex
-	projectSessions  = map[string]*ProjectSession{} // projectID → session
+	projectSessions  = map[string]*ProjectSession{} // projectID → session (alive or idle)
 )
 
 // LaunchProjectAgent starts a hermes project agent for a specific project
@@ -56,7 +59,7 @@ func LaunchProjectAgent(hub *Hub, projectID, fullPrompt string) (*ProjectSession
 		"chat", "-q", fullPrompt,
 		"--toolsets", "terminal,file,web",
 		"--yolo", "--source", "tool",
-		"--max-turns", "30",
+		"--max-turns", "60",
 		"--pass-session-id",
 	)
 	cmd.Dir = "/home/cyberkitty/Projects/control-room"
@@ -73,6 +76,15 @@ func LaunchProjectAgent(hub *Hub, projectID, fullPrompt string) (*ProjectSession
 		return nil, fmt.Errorf("start hermes: %w", err)
 	}
 
+	// Open a log file for this session — persists project agent output across page refreshes.
+	logDir := filepath.Join(os.Getenv("HOME"), ".control-room", "project_agent_logs")
+	_ = os.MkdirAll(logDir, 0o755)
+	logPath := filepath.Join(logDir, projectID+".log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		slog.Warn("project agent log file", "err", err)
+	}
+
 	channel := "project:" + projectID
 	cs := &ProjectSession{
 		id:        fmt.Sprintf("proj_%d", time.Now().Unix()),
@@ -82,6 +94,7 @@ func LaunchProjectAgent(hub *Hub, projectID, fullPrompt string) (*ProjectSession
 		stderr:    stderrPipe,
 		hub:       hub,
 		done:      make(chan struct{}),
+		logFile:   logFile,
 	}
 
 	// Broadcast launch event.
@@ -101,31 +114,57 @@ func LaunchProjectAgent(hub *Hub, projectID, fullPrompt string) (*ProjectSession
 	go func() {
 		err := cmd.Wait()
 		close(cs.done)
+		if cs.logFile != nil {
+			_ = cs.logFile.Close()
+		}
 		hub.BroadcastMessage(channel, map[string]any{
 			"type":   "ended",
 			"id":     cs.id,
 			"exit":   cmd.ProcessState.ExitCode(),
 			"error":  fmt.Sprintf("%v", err),
 		})
+		// Don't delete the session — keep it idle so we can --resume.
+		// Mark when the process ended.
 		projectMu.Lock()
 		if existing, ok := projectSessions[projectID]; ok && existing == cs {
-			delete(projectSessions, projectID)
+			cs.idleSince = time.Now()
 		}
 		projectMu.Unlock()
+
+		// Schedule cleanup after 10 minutes idle.
+		go func() {
+			time.Sleep(10 * time.Minute)
+			projectMu.Lock()
+			if existing, ok := projectSessions[projectID]; ok && existing == cs && !cs.alive() {
+				delete(projectSessions, projectID)
+			}
+			projectMu.Unlock()
+		}()
 	}()
 
 	projectSessions[projectID] = cs
 	return cs, nil
 }
 
-// SendToProjectAgent sends a follow-up message to a running project agent via --resume.
+// SendToProjectAgent sends a follow-up message to a project agent.
+// If the agent is still running → resume live session.
+// If the agent has ended but has a session ID → --resume (starts a new process
+// that continues the conversation). This keeps context across messages without
+// relaunching from scratch.
 func SendToProjectAgent(hub *Hub, projectID, message string) error {
 	projectMu.Lock()
 	cs := projectSessions[projectID]
 	projectMu.Unlock()
 
-	if cs == nil || !cs.alive() {
-		return fmt.Errorf("no project agent running for %s", projectID)
+	if cs == nil {
+		return fmt.Errorf("no project agent session for %s", projectID)
+	}
+
+	// If process is still alive, send via --resume (continues running session).
+	// If process ended but we have sessionID, also use --resume (new process, same context).
+	// If no sessionID — return error so frontend launches a new agent.
+	if cs.sessionID == "" {
+		return fmt.Errorf("no session ID for %s", projectID)
 	}
 
 	channel := "project:" + projectID
@@ -137,16 +176,91 @@ func SendToProjectAgent(hub *Hub, projectID, message string) error {
 			"chat", "-q", message,
 			"--toolsets", "terminal,file,web",
 			"--yolo", "--source", "tool",
-			"--max-turns", "20",
+			"--max-turns", "30",
+			"--pass-session-id",
 		)
 		cmd.Dir = "/home/cyberkitty/Projects/control-room"
-		out, _ := cmd.CombinedOutput()
+
+		// Reopen log file for append
+		logDir := filepath.Join(os.Getenv("HOME"), ".control-room", "project_agent_logs")
+		logPath := filepath.Join(logDir, projectID+".log")
+		logFile, _ := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+
+		stdoutPipe, err := cmd.StdoutPipe()
+		if err != nil {
+			if logFile != nil { _ = logFile.Close() }
+			return
+		}
+		stderrPipe, err := cmd.StderrPipe()
+		if err != nil {
+			if logFile != nil { _ = logFile.Close() }
+			return
+		}
+
+		if err := cmd.Start(); err != nil {
+			if logFile != nil { _ = logFile.Close() }
+			hub.BroadcastMessage(channel, map[string]any{
+				"type":  "error",
+				"id":    cs.id,
+				"text":  fmt.Sprintf("resume failed: %v", err),
+			})
+			return
+		}
+
+		// Create a new session object for this resumed process
+		resumeCS := &ProjectSession{
+			id:        cs.id,
+			projectID: projectID,
+			cmd:       cmd,
+			hub:       hub,
+			done:      make(chan struct{}),
+			logFile:   logFile,
+		}
+
+		// Broadcast started event
 		hub.BroadcastMessage(channel, map[string]any{
-			"type":   "output",
-			"id":     cs.id,
-			"source": "user_followup",
-			"text":   string(out),
+			"type":       "started",
+			"id":         resumeCS.id,
+			"project_id": projectID,
+			"pid":        cmd.Process.Pid,
 		})
+
+		go resumeCS.streamOutput(stdoutPipe, "output", channel)
+		go resumeCS.streamOutput(stderrPipe, "error", channel)
+
+		// Wait for process to finish
+		go func() {
+			err := cmd.Wait()
+			close(resumeCS.done)
+			if resumeCS.logFile != nil { _ = resumeCS.logFile.Close() }
+			hub.BroadcastMessage(channel, map[string]any{
+				"type":  "ended",
+				"id":    resumeCS.id,
+				"exit":  cmd.ProcessState.ExitCode(),
+				"error": fmt.Sprintf("%v", err),
+			})
+			// Mark idle, keep sessionID for future resumes
+			projectMu.Lock()
+			if existing, ok := projectSessions[projectID]; ok && existing == cs {
+				existing.idleSince = time.Now()
+			}
+			projectMu.Unlock()
+
+			// Schedule cleanup
+			go func() {
+				time.Sleep(10 * time.Minute)
+				projectMu.Lock()
+				if existing, ok := projectSessions[projectID]; ok && existing == cs && !cs.alive() {
+					delete(projectSessions, projectID)
+				}
+				projectMu.Unlock()
+			}()
+		}()
+
+		// Update the session map with the resumed session
+		projectMu.Lock()
+		projectSessions[projectID] = resumeCS
+		projectMu.Unlock()
 	}()
 
 	return nil
@@ -174,13 +288,22 @@ func GetProjectAgentStatus(projectID string) map[string]any {
 	cs := projectSessions[projectID]
 	projectMu.Unlock()
 
-	if cs == nil || !cs.alive() {
+	if cs == nil {
 		return map[string]any{"running": false}
 	}
+	if cs.alive() {
+		return map[string]any{
+			"running":    true,
+			"id":         cs.id,
+			"pid":        cs.cmd.Process.Pid,
+			"session_id": cs.sessionID,
+		}
+	}
+	// Idle session — has sessionID for resume
 	return map[string]any{
-		"running":    true,
+		"running":    false,
+		"idle":       true,
 		"id":         cs.id,
-		"pid":        cs.cmd.Process.Pid,
 		"session_id": cs.sessionID,
 	}
 }
@@ -213,33 +336,102 @@ func (cs *ProjectSession) alive() bool {
 func (cs *ProjectSession) streamOutput(r io.Reader, source, channel string) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := sc.Text()
 
-		// Try to capture session ID from hermes output.
-		if strings.Contains(line, "session_id") || strings.Contains(line, "Session ID:") {
-			cs.extractSessionID(line)
+	// Buffer lines and flush in blocks by kind (tool vs text).
+	var buf []string
+	var bufKind string
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		text := strings.Join(buf, "\n")
+		buf = nil
+		bufKind = ""
+
+		// Write to log file as JSONL — one entry per block.
+		if cs.logFile != nil {
+			ts := time.Now().UTC().Format(time.RFC3339)
+			entry := struct {
+				Ts   string `json:"ts"`
+				Type string `json:"type"`
+				Body string `json:"body"`
+			}{ts, source, text}
+			b, _ := json.Marshal(entry)
+			fmt.Fprintf(cs.logFile, "%s\n", b)
 		}
 
 		cs.hub.BroadcastMessage(channel, map[string]any{
 			"type":   source,
 			"id":     cs.id,
-			"text":   line,
+			"text":   text,
 			"ts":     time.Now().UTC().Format(time.RFC3339),
 		})
 	}
+
+	for sc.Scan() {
+		line := sc.Text()
+		// Try to capture session ID from hermes output.
+		// Hermes outputs: "hermes --resume SESSION_ID -p hw_agent_project"
+		// and: "Session:   SESSION_ID"
+		if strings.Contains(line, "--resume") || strings.Contains(line, "Session:") || strings.Contains(line, "session_id") {
+			cs.extractSessionID(line)
+		}
+
+		trimmed := strings.TrimLeft(line, " 	")
+		var kind string
+		if trimmed == "" {
+			kind = bufKind
+		} else if strings.HasPrefix(trimmed, "┊") || strings.HasPrefix(trimmed, "🔧") ||
+			strings.HasPrefix(trimmed, "💻") || strings.HasPrefix(trimmed, "$") ||
+			strings.HasPrefix(trimmed, "───") || strings.HasPrefix(trimmed, "Initializing") {
+			kind = "tool"
+		} else {
+			kind = "text"
+		}
+
+		if bufKind != "" && kind != "" && kind != bufKind {
+			flush()
+		}
+		if kind != "" {
+			bufKind = kind
+		}
+		buf = append(buf, line)
+	}
+	flush()
 }
 
 func (cs *ProjectSession) extractSessionID(line string) {
-	parts := strings.Fields(line)
-	for i, p := range parts {
-		if (p == "session_id" || p == "Session" || p == "ID:") && i+1 < len(parts) {
-			candidate := strings.Trim(parts[i+1], ",;:\"'")
-			if len(candidate) > 8 && (strings.Contains(candidate, "_") || strings.Contains(candidate, "-")) {
-				cs.mu.Lock()
-				cs.sessionID = candidate
-				cs.mu.Unlock()
-				slog.Info("project agent session id captured", "session", candidate, "project", cs.projectID)
+	// Hermes outputs: "hermes --resume 20260627_223615_be0df9 -p hw_agent_project"
+	// Also tries: "Session: 20260627_223615_be0df9"
+	if strings.Contains(line, "--resume") {
+		parts := strings.Fields(line)
+		for i, p := range parts {
+			if p == "--resume" && i+1 < len(parts) {
+				candidate := strings.Trim(parts[i+1], ",;:\"'")
+				if len(candidate) > 8 {
+					cs.mu.Lock()
+					cs.sessionID = candidate
+					cs.mu.Unlock()
+					slog.Info("project agent session id captured", "session", candidate, "project", cs.projectID)
+					return
+				}
+			}
+		}
+	}
+	// Also try "Session: XXX" format
+	if strings.Contains(line, "Session:") {
+		parts := strings.Fields(line)
+		for i, p := range parts {
+			if p == "Session:" && i+1 < len(parts) {
+				candidate := strings.Trim(parts[i+1], ",;:\"'")
+				if len(candidate) > 8 {
+					cs.mu.Lock()
+					cs.sessionID = candidate
+					cs.mu.Unlock()
+					slog.Info("project agent session id captured", "session", candidate, "project", cs.projectID)
+					return
+				}
 			}
 		}
 	}
@@ -273,6 +465,40 @@ func (s *Server) apiProjectAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch action {
+	case "history":
+		// GET /api/v1/project-agent/{id}/history — returns session log as JSONL
+		logDir := filepath.Join(os.Getenv("HOME"), ".control-room", "project_agent_logs")
+		logPath := filepath.Join(logDir, projectID+".log")
+		data, err := os.ReadFile(logPath)
+		if err != nil {
+			jsonResponse(w, map[string]any{"messages": []any{}})
+			return
+		}
+		var messages []map[string]any
+		for _, line := range strings.Split(string(data), "\n") {
+			if line == "" || !strings.HasPrefix(line, "{") {
+				continue
+			}
+			var entry struct {
+				Ts   string `json:"ts"`
+				Type string `json:"type"`
+				Body string `json:"body"`
+			}
+			if err := json.Unmarshal([]byte(line), &entry); err != nil {
+				continue
+			}
+			role := "agent"
+			if entry.Type == "error" {
+				role = "system"
+			}
+			messages = append(messages, map[string]any{
+				"role":      role,
+				"body":      entry.Body,
+				"timestamp": entry.Ts,
+				"type":      entry.Type,
+			})
+		}
+		jsonResponse(w, map[string]any{"messages": messages})
 	case "launch":
 		if r.Method != http.MethodPost {
 			jsonError(w, "launch requires POST", http.StatusMethodNotAllowed)
@@ -317,6 +543,12 @@ func (s *Server) apiProjectAgent(w http.ResponseWriter, r *http.Request) {
 			if compiled.PreviousFailures != "" {
 				fullPrompt += "\n### Предыдущие неудачи\n" + compiled.PreviousFailures + "\n"
 			}
+			if len(compiled.Evidence) > 0 {
+				fullPrompt += fmt.Sprintf("\n### Evidence (%d)\n", len(compiled.Evidence))
+				for _, e := range compiled.Evidence {
+					fullPrompt += "- " + e + "\n"
+				}
+			}
 		}
 		fullPrompt += "\nОтветь на русском."
 
@@ -352,12 +584,7 @@ func (s *Server) apiProjectAgent(w http.ResponseWriter, r *http.Request) {
 			jsonError(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// Echo user message to channel
-		s.hub.BroadcastMessage("project:"+projectID, map[string]any{
-			"type": "user_message",
-			"text": body.Message,
-			"ts":   time.Now().UTC().Format(time.RFC3339),
-		})
+		// No user_message echo — frontend already added it locally via appendToStream
 		jsonResponse(w, map[string]any{"status": "sent"})
 
 	case "stop":

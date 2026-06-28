@@ -22,10 +22,11 @@ type CompiledContext struct {
 	Narrative       string `json:"narrative"`         // latest narrative memory
 	Policy          string `json:"policy"`            // decisions/constraints (policy entries)
 	RawEntries      int    `json:"raw_entries"`       // count of raw memory entries
-	PreviousFailures string `json:"previous_failures"` // recent failed runs
-	OpenTasks       []TaskBrief `json:"open_tasks"`   // tasks not done
-	Constraints     string `json:"constraints"`      // project-level constraints
-	GeneratedAt     string `json:"generated_at"`
+	PreviousFailures string       `json:"previous_failures"` // recent failed runs
+	Evidence         []string     `json:"evidence"`          // notable events: merge errors, rejections
+	OpenTasks        []TaskBrief  `json:"open_tasks"`         // tasks not done
+	Constraints      string       `json:"constraints"`        // project-level constraints
+	GeneratedAt      string       `json:"generated_at"`
 }
 
 // TaskBrief is a compact task summary for context.
@@ -113,7 +114,8 @@ func (s *Server) compileProjectContext(ctx *CompiledContext) {
 		return
 	}
 	ctx.Title = p.Title
-	ctx.Mission = fmt.Sprintf("Проект \"%s\". Репозиторий: %s. Язык: %s.", p.Title, p.RepoPath, p.Language)
+	ctx.Mission = fmt.Sprintf("Проект \"%s\" (ID: %s). Репозиторий: %s. Язык: %s. Команда: %s.",
+		p.Title, p.ID, p.RepoPath, p.Language, p.DefaultTeam)
 	ctx.Constraints = fmt.Sprintf("Test: %s, Lint: %s", p.TestCommand, p.LintCommand)
 
 	// Latest narrative
@@ -133,6 +135,12 @@ func (s *Server) compileProjectContext(ctx *CompiledContext) {
 	// Count raw entries
 	rawEntries, _ := s.db.GetMemory("project", ctx.NodeID, "raw", 1)
 	ctx.RawEntries = len(rawEntries)
+
+	// Evidence — merge errors, rejections, failures
+	evidenceEntries, _ := s.db.GetEvidence("project", ctx.NodeID)
+	for _, e := range evidenceEntries {
+		ctx.Evidence = append(ctx.Evidence, e.Content)
+	}
 
 	// Open tasks for this project
 	allTasks, _ := s.store.ListTasks()

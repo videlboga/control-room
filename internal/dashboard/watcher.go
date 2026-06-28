@@ -3,6 +3,7 @@ package dashboard
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -373,6 +374,48 @@ func jsonRaw(v any) json.RawMessage {
 	return b
 }
 
+// writeProjectMemoryFile writes a memory.md file for a project, combining
+// narrative + policy from the SQLite memory_entries. This file is read by
+// the orchestrator's buildPrompt to give task agents access to project memory.
+func (w *Watcher) writeProjectMemoryFile(projectID string) {
+	if w.db == nil {
+		return
+	}
+
+	narrative, _ := w.db.GetLatestNarrative("project", projectID)
+	policies, _ := w.db.GetPolicy("project", projectID)
+	evidence, _ := w.db.GetEvidence("project", projectID)
+
+	var b strings.Builder
+	if narrative != "" {
+		b.WriteString("## Narrative\n")
+		b.WriteString(narrative)
+		b.WriteString("\n\n")
+	}
+	if len(policies) > 0 {
+		b.WriteString("## Policy\n")
+		for _, p := range policies {
+			b.WriteString("- ")
+			b.WriteString(p.Content)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	if len(evidence) > 0 {
+		b.WriteString("## Recent Evidence\n")
+		for _, e := range evidence {
+			b.WriteString("- ")
+			b.WriteString(e.Content)
+			b.WriteString("\n")
+		}
+	}
+
+	memPath := filepath.Join(w.root, "projects", projectID, "memory.md")
+	if err := os.WriteFile(memPath, []byte(b.String()), 0o644); err != nil {
+		slog.Warn("writeProjectMemoryFile", "project", projectID, "err", err)
+	}
+}
+
 // writeRawMemory writes a raw memory entry for a completed run.
 // This captures the run summary, tool count, and verdict as the base layer
 // for the memory pipeline (raw → narrative → briefing).
@@ -406,6 +449,82 @@ func (w *Watcher) writeRawMemory(rn *run.Run, toolCount int) {
 	if rn.ProjectID != "" {
 		if _, err := w.db.AddMemory("project", rn.ProjectID, "raw", string(content), "system"); err != nil {
 			slog.Warn("writeRawMemory project", "run", rn.ID, "err", err)
+		}
+	}
+
+	// Write evidence for notable events: failures, merge errors, verdicts
+	w.writeEvidence(rn)
+
+	// Update memory.md file for the project so orchestrator's buildPrompt can read it
+	if rn.ProjectID != "" {
+		w.writeProjectMemoryFile(rn.ProjectID)
+	}
+}
+
+// writeEvidence writes evidence-layer entries for notable run events.
+// Evidence captures specific artifacts: merge errors, failures, verdicts, commits.
+func (w *Watcher) writeEvidence(rn *run.Run) {
+	if w.db == nil {
+		return
+	}
+
+	// Evidence for failed runs
+	if rn.Status == "failed" {
+		ev := map[string]any{
+			"type":      "run_failed",
+			"run_id":    rn.ID,
+			"task_id":   rn.TaskID,
+			"agent":     rn.Agent,
+			"step":      rn.Step,
+			"summary":   rn.Summary,
+			"ended_at":  rn.EndedAt,
+		}
+		if b, err := json.Marshal(ev); err == nil {
+			w.db.AddEvidence("task", rn.TaskID, string(b), "system")
+			if rn.ProjectID != "" {
+				w.db.AddEvidence("project", rn.ProjectID, string(b), "system")
+			}
+		}
+	}
+
+	// Evidence for merge errors — check run metadata
+	metaPath := filepath.Join(w.root, "runs", rn.ID, "metadata.json")
+	if data, err := os.ReadFile(metaPath); err == nil {
+		var meta map[string]any
+		if json.Unmarshal(data, &meta) == nil {
+			if reason, ok := meta["reason"]; ok {
+				reasonStr := fmt.Sprintf("%v", reason)
+				if strings.Contains(reasonStr, "merge") || strings.Contains(reasonStr, "rebase") {
+					ev := map[string]any{
+						"type":       "merge_error",
+						"run_id":     rn.ID,
+						"task_id":    rn.TaskID,
+						"reason":     reasonStr,
+						"verdict":    meta["verdict"],
+						"ended_at":   rn.EndedAt,
+					}
+					if b, err := json.Marshal(ev); err == nil {
+						w.db.AddEvidence("task", rn.TaskID, string(b), "system")
+						if rn.ProjectID != "" {
+							w.db.AddEvidence("project", rn.ProjectID, string(b), "system")
+						}
+					}
+				}
+			}
+			// Evidence for verdicts
+			if verdict, ok := meta["verdict"]; ok && verdict == "reject" {
+				ev := map[string]any{
+					"type":       "verdict_reject",
+					"run_id":     rn.ID,
+					"task_id":    rn.TaskID,
+					"reason":     meta["reason"],
+					"agent":      rn.Agent,
+					"step":       rn.Step,
+				}
+				if b, err := json.Marshal(ev); err == nil {
+					w.db.AddEvidence("task", rn.TaskID, string(b), "system")
+				}
+			}
 		}
 	}
 }

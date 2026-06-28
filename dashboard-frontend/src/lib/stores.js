@@ -70,6 +70,7 @@ export const currentChat = writable({        // currently selected chat
 export const conversation = writable([])     // messages for current chat (comments + events)
 export const controllerMessages = writable([]) // DEPRECATED — use agentStreams instead
 export const agentStreams = writable({})     // map: nodeKey → messages[] (live agent output per node)
+export const agentRunning = writable({})    // map: nodeKey → boolean (is agent running for this node)
 
 function handleMessage(msg) {
   switch (msg.type) {
@@ -202,9 +203,11 @@ function handleMessage(msg) {
       break
     case 'started':
       appendToActiveStream(msg, 'system', `Agent started (PID: ${msg.pid || msg.data?.pid || '?'})`)
+      setAgentRunning(true)
       break
     case 'ended':
       appendToActiveStream(msg, 'system', `Agent ended (exit: ${msg.exit || msg.data?.exit || '?'})`)
+      setAgentRunning(false)
       break
     // Project agent streaming — same format as controller but on "project:{id}" channel.
     // The output/started/ended/error types are the same, so they're already handled above.
@@ -265,6 +268,27 @@ export function appendToStream(nodeKey, msg) {
     if (!streams[nodeKey]) streams[nodeKey] = []
     streams[nodeKey] = [...streams[nodeKey], msg]
     return { ...streams }
+  })
+}
+
+// Set agent running state for a node
+function setAgentRunning(running) {
+  const cc = get(currentChat)
+  let nodeKey
+  if (cc.type === 'workspace') nodeKey = 'workspace'
+  else if (cc.type === 'project') nodeKey = 'project:' + cc.id
+  else return
+  agentRunning.update(states => {
+    states[nodeKey] = running
+    return { ...states }
+  })
+}
+
+// Exported for ChatView to set running state on launch
+export function setAgentRunningForKey(nodeKey, running) {
+  agentRunning.update(states => {
+    states[nodeKey] = running
+    return { ...states }
   })
 }
 
@@ -387,6 +411,25 @@ export async function loadControllerHistory() {
     })
   } catch (e) {
     console.error('loadControllerHistory:', e)
+  }
+}
+
+export async function loadProjectAgentHistory(projectId) {
+  try {
+    const data = await apiGet(`/project-agent/${projectId}/history`)
+    const msgs = (data.messages || []).map(m => ({
+      role: m.role || 'agent',
+      body: m.body || '',
+      timestamp: m.timestamp || '',
+      type: m.type || 'output',
+    }))
+    const key = 'project:' + projectId
+    agentStreams.update(streams => {
+      streams[key] = msgs
+      return { ...streams }
+    })
+  } catch (e) {
+    console.error('loadProjectAgentHistory:', e)
   }
 }
 

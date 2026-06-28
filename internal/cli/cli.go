@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"control-room/internal/analyzer"
 	"control-room/internal/comment"
 	"control-room/internal/config"
 	"control-room/internal/epic"
@@ -65,6 +66,7 @@ func NewRootCmd() *cobra.Command {
 	rootCmd.AddCommand(orchestrateCmd())
 	rootCmd.AddCommand(runCmd())
 	rootCmd.AddCommand(workspaceCmd())
+	rootCmd.AddCommand(analyzeCmd())
 	return rootCmd
 }
 
@@ -904,6 +906,158 @@ func workspaceCmd() *cobra.Command {
 	setRuntime.Flags().String("timeout", "", "default timeout")
 
 	cmd.AddCommand(runtime, setRuntime)
+	return cmd
+}
+
+func analyzeCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "analyze",
+		Short: "Analyze agent runs and generate improvement reports",
+	}
+
+	profileFlag := ""
+	providerFlag := ""
+	modelFlag := ""
+
+	run := &cobra.Command{
+		Use:   "runs",
+		Short: "Run a one-shot analysis of recent runs and save a report",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			cfg, _ := config.LoadOrCreate(st.Root)
+			prof := profileFlag
+			if prof == "" {
+				prof = "hw_agent_controller"
+			}
+			prov := providerFlag
+			mdl := modelFlag
+			if cfg != nil {
+				if prov == "" {
+					prov = cfg.RuntimeConfig.Provider
+				}
+				if mdl == "" {
+					mdl = cfg.RuntimeConfig.Model
+				}
+			}
+			sinceStr, _ := cmd.Flags().GetString("since")
+			if sinceStr != "" {
+				d, err := time.ParseDuration(sinceStr)
+				if err != nil {
+					return fmt.Errorf("invalid --since %q: %w", sinceStr, err)
+				}
+				since := time.Now().UTC().Add(-d)
+				fmt.Printf("analyzing runs from last %s (since %s)...\n", sinceStr, since.Format(time.RFC3339))
+				reportPath, err := analyzer.Run(st, prof, prov, mdl, since)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "analysis failed: %v\n", err)
+					return err
+				}
+				fmt.Printf("analysis report saved: %s\n", reportPath)
+				fmt.Printf("metrics snapshot and raw output in: %s\n", filepath.Join(st.Root, "reports"))
+				return nil
+			}
+			fmt.Printf("analyzing runs since last analysis...\n")
+			reportPath, err := analyzer.RunSinceLast(st, prof, prov, mdl)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "analysis failed: %v\n", err)
+				return err
+			}
+			fmt.Printf("analysis report saved: %s\n", reportPath)
+			fmt.Printf("metrics snapshot and raw output in: %s\n", filepath.Join(st.Root, "reports"))
+			return nil
+		},
+	}
+	run.Flags().StringVar(&profileFlag, "profile", "", "Hermes profile to use (default: hw_agent_controller)")
+	run.Flags().StringVar(&providerFlag, "provider", "", "Hermes provider override")
+	run.Flags().StringVar(&modelFlag, "model", "", "Hermes model override")
+	run.Flags().String("since", "", "Analyze runs within a recent duration (e.g. 30h, 2d, 90m) instead of since last marker")
+
+	all := &cobra.Command{
+		Use:   "all",
+		Short: "Analyze ALL runs (ignores last-analyzed marker)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			cfg, _ := config.LoadOrCreate(st.Root)
+			prof := profileFlag
+			if prof == "" {
+				prof = "hw_agent_controller"
+			}
+			prov := providerFlag
+			mdl := modelFlag
+			if cfg != nil {
+				if prov == "" {
+					prov = cfg.RuntimeConfig.Provider
+				}
+				if mdl == "" {
+					mdl = cfg.RuntimeConfig.Model
+				}
+			}
+			fmt.Printf("analyzing all runs...\n")
+			reportPath, err := analyzer.Run(st, prof, prov, mdl, time.Time{})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "analysis failed: %v\n", err)
+				return err
+			}
+			fmt.Printf("analysis report saved: %s\n", reportPath)
+			return nil
+		},
+	}
+	all.Flags().StringVar(&profileFlag, "profile", "", "Hermes profile to use (default: hw_agent_controller)")
+	all.Flags().StringVar(&providerFlag, "provider", "", "Hermes provider override")
+	all.Flags().StringVar(&modelFlag, "model", "", "Hermes model override")
+
+	loop := &cobra.Command{
+		Use:   "loop",
+		Short: "Run the analyzer periodically (blocks forever)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st := storeFromFlags(cmd)
+			cfg, _ := config.LoadOrCreate(st.Root)
+			prof := profileFlag
+			if prof == "" {
+				prof = "hw_agent_controller"
+			}
+			prov := providerFlag
+			mdl := modelFlag
+			if cfg != nil {
+				if prov == "" {
+					prov = cfg.RuntimeConfig.Provider
+				}
+				if mdl == "" {
+					mdl = cfg.RuntimeConfig.Model
+				}
+			}
+			intervalStr, _ := cmd.Flags().GetString("interval")
+			interval, err := time.ParseDuration(intervalStr)
+			if err != nil {
+				return fmt.Errorf("invalid interval %q: %w", intervalStr, err)
+			}
+			if interval < 5*time.Minute {
+				return fmt.Errorf("interval must be at least 5m, got %s", interval)
+			}
+			windowStr, _ := cmd.Flags().GetString("window")
+			var window time.Duration
+			if windowStr != "" {
+				window, err = time.ParseDuration(windowStr)
+				if err != nil {
+					return fmt.Errorf("invalid --window %q: %w", windowStr, err)
+				}
+				if window < time.Hour {
+					return fmt.Errorf("--window must be at least 1h, got %s", window)
+				}
+			}
+			analyzer.Loop(st, prof, prov, mdl, interval, window, func(msg string) {
+				fmt.Printf("[analyzer] %s\n", msg)
+			})
+			return nil
+		},
+	}
+	loop.Flags().String("interval", "6h", "analysis interval (e.g. 6h, 30m, 1h)")
+	loop.Flags().String("window", "", "rolling window duration for each sweep (e.g. 30h, 2d); empty = incremental since last marker")
+	loop.Flags().StringVar(&profileFlag, "profile", "", "Hermes profile to use (default: hw_agent_controller)")
+	loop.Flags().StringVar(&providerFlag, "provider", "", "Hermes provider override")
+	loop.Flags().StringVar(&modelFlag, "model", "", "Hermes model override")
+
+	cmd.AddCommand(run, all, loop)
 	return cmd
 }
 

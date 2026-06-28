@@ -4,7 +4,8 @@ import {
   apiGet, apiPost, loadConversation, sendWS,
   subscribeConversation, unsubscribeConversation,
   subscribeRun, unsubscribeRun, activeRuns,
-  agentStreams, appendToStream
+  agentStreams, appendToStream, loadProjectAgentHistory,
+  agentRunning, setAgentRunningForKey
 } from '../lib/stores.js'
 import { onMount, onDestroy } from 'svelte'
 
@@ -15,24 +16,27 @@ let sending = $state(false)
 let scrollContainer = $state(null)
 let prevChat = null  // track previous chat for unsub
 
-// Controller state
-let controllerRunning = $state(false)
+// Controller state — derived from agentRunning store
+let controllerRunning = $derived($agentRunning['workspace'] || false)
 
-// Project agent state
-let projectAgentRunning = $state(false)
+// Project agent state — derived from agentRunning store
+let projectAgentRunning = $derived(chat?.type === 'project' ? ($agentRunning['project:' + chat.id] || false) : false)
 
 async function checkController() {
   try {
     const s = await apiGet('/controller/status')
-    controllerRunning = s.running || false
+    setAgentRunningForKey('workspace', s.running || false)
   } catch (e) { /* ignore */ }
 }
 
 async function checkProjectAgent(projectId) {
   try {
     const s = await apiGet(`/project-agent/${projectId}/status`)
-    projectAgentRunning = s.running || false
+    // running=true OR idle=true → can resume via /send
+    setAgentRunningForKey('project:' + projectId, s.running || false)
+    return s
   } catch (e) { /* ignore */ }
+  return null
 }
 
 onMount(() => {
@@ -48,6 +52,7 @@ onMount(() => {
     } else if (chat.type === 'project') {
       sendWS({ action: 'subscribe', channel: `project:${chat.id}` })
       checkProjectAgent(chat.id)
+      loadProjectAgentHistory(chat.id)
     }
     if (chat.type === 'task') {
       const run = $activeRuns.find(r => r.task_id === chat.id)
@@ -83,6 +88,7 @@ $effect(() => {
   if (c.type === 'project') {
     sendWS({ action: 'subscribe', channel: `project:${c.id}` })
     checkProjectAgent(c.id)
+    loadProjectAgentHistory(c.id)
   }
 
   // If task with active run, subscribe to run channel for live logs
@@ -144,27 +150,46 @@ async function handleSend() {
         await apiPost('/controller/send', { message: body })
       } else {
         await apiPost('/controller/launch', { prompt: body })
-        controllerRunning = true
+        setAgentRunningForKey('workspace', true)
       }
     } catch (e) {
       console.error('controller send:', e)
-      appendToStream('workspace', { role: 'system', body: 'Error: ' + e.message, timestamp: new Date().toISOString() })
+      // Send failed — controller likely died. Reset state and launch.
+      setAgentRunningForKey('workspace', false)
+      try {
+        await apiPost('/controller/launch', { prompt: body })
+        setAgentRunningForKey('workspace', true)
+      } catch (e2) {
+        appendToStream('workspace', { role: 'system', body: 'Error: ' + e2.message, timestamp: new Date().toISOString() })
+      }
     }
   } else if (chat?.type === 'project') {
     // Project chat: message goes to project agent.
     const pKey = 'project:' + chat.id
     appendToStream(pKey, { role: 'human', body, timestamp: new Date().toISOString() })
     try {
-      if (projectAgentRunning) {
+      // Check if agent is running OR idle (has session_id for resume)
+      const status = await checkProjectAgent(chat.id)
+      if (status && (status.running || status.idle)) {
+        // Resume existing session
         await apiPost(`/project-agent/${chat.id}/send`, { message: body })
+        setAgentRunningForKey(pKey, true)
       } else {
+        // Launch new session with compiled context
         await apiPost(`/project-agent/${chat.id}/launch`, { prompt: body })
-        projectAgentRunning = true
+        setAgentRunningForKey(pKey, true)
       }
-      await sendChatMessage(chat.type, chat.id, body)
     } catch (e) {
       console.error('project agent:', e)
-      appendToStream(pKey, { role: 'system', body: 'Error: ' + e.message, timestamp: new Date().toISOString() })
+      // If send failed (no session ID, agent died, etc.) — launch new agent
+      appendToStream(pKey, { role: 'system', body: 'Launching new agent session...', timestamp: new Date().toISOString() })
+      setAgentRunningForKey(pKey, false)
+      try {
+        await apiPost(`/project-agent/${chat.id}/launch`, { prompt: body })
+        setAgentRunningForKey(pKey, true)
+      } catch (e2) {
+        appendToStream(pKey, { role: 'system', body: 'Error: ' + e2.message, timestamp: new Date().toISOString() })
+      }
     }
   } else {
     // Normal conversation (task, run)
@@ -209,23 +234,21 @@ function isToolMessage(msg) {
   if (msg.role === 'event' || msg.role === 'log') return true
   // By type — explicit tool/log types
   if (msg.type === 'tool_call' || msg.type === 'log_line') return true
-  // Agent output (role=agent, type=output) — check content
+  // Agent output — check content. Messages are now multi-line blocks.
   if (msg.role === 'agent' || msg.type === 'output' || msg.type === 'error') {
     const trimmed = (msg.body || '').trim()
-    if (!trimmed) return false  // empty lines stay as individual
+    if (!trimmed) return false
     // Hermes response blocks — NOT tool messages, keep visible
     if (trimmed.includes('⚕') || trimmed.includes('Hermes')) return false
     // Prompt echoes and context blocks — NOT tool messages
     if (trimmed.startsWith('Query:') || trimmed.startsWith('##') || trimmed.startsWith('**')) return false
-    // ┊ prefixed lines = tool/skill output — collapse
-    if (trimmed.startsWith('┊')) return true
-    // 🔧 prefixed = tool calls — collapse
-    if (trimmed.startsWith('🔧') || trimmed.startsWith('💻')) return true
-    // Shell commands — collapse
-    if (trimmed.startsWith('$')) return true
-    // Divider lines — collapse
-    if (trimmed.startsWith('───')) return true
-    // Everything else from agent = actual response text — keep visible
+    // Multi-line block: check if FIRST line is a tool prefix
+    const firstLine = trimmed.split('\n')[0].trim()
+    if (firstLine.startsWith('┊') || firstLine.startsWith('🔧') || firstLine.startsWith('💻') ||
+        firstLine.startsWith('$') || firstLine.startsWith('───')) {
+      return true
+    }
+    // Everything else = actual response text — keep visible
     return false
   }
   return false
@@ -266,7 +289,8 @@ function formatToolLine(msg) {
 
 // Controller controls
 async function stopController() {
-  try { await apiPost('/controller/stop', {}) ; controllerRunning = false } catch (e) {}
+  try { await apiPost('/controller/stop', {}) } catch (e) {}
+  setAgentRunningForKey('workspace', false)
 }
 
 // Workspace chat: first message launches the controller, subsequent messages go via /controller/send
@@ -288,7 +312,7 @@ async function stopController() {
     {:else if chat?.type === 'project' && projectAgentRunning}
       <div class="controller-controls">
         <span class="status-pill running">Agent</span>
-        <button class="ctrl-btn stop" onclick={async () => { try { await apiPost(`/project-agent/${chat.id}/stop`, {}) } catch(e) {} projectAgentRunning = false }}>Stop</button>
+        <button class="ctrl-btn stop" onclick={async () => { try { await apiPost(`/project-agent/${chat.id}/stop`, {}) } catch(e) {} setAgentRunningForKey('project:' + chat.id, false) }}>Stop</button>
       </div>
     {/if}
   </div>

@@ -304,6 +304,27 @@ func (s *Server) GetLivePreviews() []LivePreview {
 		})
 	}
 
+	// Check running project agents
+	projectAgents := ListRunningProjectAgents()
+	for _, pa := range projectAgents {
+		pid := pa["project_id"].(string)
+		title := pid
+		agent := "project"
+		p, err := s.store.GetProject(pid)
+		if err == nil && p != nil {
+			title = p.Title
+		}
+		previews = append(previews, LivePreview{
+			Type:    "project",
+			ID:      pid,
+			Title:   title,
+			ProjectID: pid,
+			Agent:   agent,
+			Status:  "running",
+			Tail:    "",
+		})
+	}
+
 	return previews
 }
 

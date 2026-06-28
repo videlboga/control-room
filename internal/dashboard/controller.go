@@ -226,43 +226,107 @@ func (cs *ControllerSession) alive() bool {
 func (cs *ControllerSession) streamOutput(r io.Reader, source, epicID string) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := sc.Text()
 
-		// Try to capture session ID from hermes output.
-		if strings.Contains(line, "session_id") || strings.Contains(line, "Session ID:") {
-			cs.extractSessionID(line)
+	// Buffer lines and flush in blocks. Lines of the same "kind" (┊ vs non-┊)
+	// are accumulated and sent as a single WS message with joined text.
+	// This prevents one agent response from becoming 20 separate messages.
+	var buf []string
+	var bufKind string // "tool" (┊/🔧/$/───) or "text" (everything else)
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
 		}
+		text := strings.Join(buf, "\n")
+		buf = nil
+		bufKind = ""
 
-		// Write to log file for persistence.
+		// Write to log file as JSONL — one entry per block (not per line).
 		if cs.logFile != nil {
 			ts := time.Now().UTC().Format(time.RFC3339)
-			fmt.Fprintf(cs.logFile, "[%s] %s\n", ts, line)
+			entry := struct {
+				Ts   string `json:"ts"`
+				Type string `json:"type"`
+				Body string `json:"body"`
+			}{ts, source, text}
+			b, _ := json.Marshal(entry)
+			fmt.Fprintf(cs.logFile, "%s\n", b)
 		}
 
-		// Broadcast each line to WS channel "controller".
 		cs.hub.BroadcastMessage("controller", map[string]any{
 			"type":    source,
 			"id":      cs.id,
 			"epic_id": epicID,
-			"text":    line,
+			"text":    text,
 			"ts":      time.Now().UTC().Format(time.RFC3339),
 		})
 	}
+
+	for sc.Scan() {
+		line := sc.Text()
+
+		// Try to capture session ID from hermes output.
+		if strings.Contains(line, "--resume") || strings.Contains(line, "Session:") || strings.Contains(line, "session_id") {
+			cs.extractSessionID(line)
+		}
+
+		// Determine line kind
+		trimmed := strings.TrimLeft(line, " 	")
+		var kind string
+		if trimmed == "" {
+			kind = bufKind // empty line inherits current buffer kind
+		} else if strings.HasPrefix(trimmed, "┊") || strings.HasPrefix(trimmed, "🔧") ||
+			strings.HasPrefix(trimmed, "💻") || strings.HasPrefix(trimmed, "$") ||
+			strings.HasPrefix(trimmed, "───") || strings.HasPrefix(trimmed, "Initializing") {
+			kind = "tool"
+		} else {
+			kind = "text"
+		}
+
+		// Flush if kind changed (and buffer is non-empty and non-empty-kind)
+		if bufKind != "" && kind != "" && kind != bufKind {
+			flush()
+		}
+
+		if kind != "" {
+			bufKind = kind
+		}
+		buf = append(buf, line)
+	}
+	// Flush remaining buffer.
+	flush()
 }
 
 func (cs *ControllerSession) extractSessionID(line string) {
-	// Hermes outputs session ID in various formats.
-	// Try to extract it for --resume later.
-	parts := strings.Fields(line)
-	for i, p := range parts {
-		if (p == "session_id" || p == "Session" || p == "ID:") && i+1 < len(parts) {
-			candidate := strings.Trim(parts[i+1], ",;:\"'")
-			if len(candidate) > 8 && (strings.Contains(candidate, "_") || strings.Contains(candidate, "-")) {
-				cs.mu.Lock()
-				cs.sessionID = candidate
-				cs.mu.Unlock()
-				slog.Info("controller session id captured", "id", candidate)
+	// Hermes outputs: "hermes --resume 20260627_223615_be0df9 -p hw_agent_controller"
+	if strings.Contains(line, "--resume") {
+		parts := strings.Fields(line)
+		for i, p := range parts {
+			if p == "--resume" && i+1 < len(parts) {
+				candidate := strings.Trim(parts[i+1], ",;:\"'")
+				if len(candidate) > 8 {
+					cs.mu.Lock()
+					cs.sessionID = candidate
+					cs.mu.Unlock()
+					slog.Info("controller session id captured", "id", candidate)
+					return
+				}
+			}
+		}
+	}
+	// Also try "Session: XXX" format
+	if strings.Contains(line, "Session:") {
+		parts := strings.Fields(line)
+		for i, p := range parts {
+			if p == "Session:" && i+1 < len(parts) {
+				candidate := strings.Trim(parts[i+1], ",;:\"'")
+				if len(candidate) > 8 {
+					cs.mu.Lock()
+					cs.sessionID = candidate
+					cs.mu.Unlock()
+					slog.Info("controller session id captured", "id", candidate)
+					return
+				}
 			}
 		}
 	}
@@ -303,26 +367,29 @@ func (s *Server) apiControllerHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse lines: [timestamp] text
+	// Parse JSONL — each line is a JSON object with ts, type, body
 	var messages []map[string]any
 	for _, line := range strings.Split(string(data), "\n") {
-		if line == "" {
+		if line == "" || !strings.HasPrefix(line, "{") {
 			continue
 		}
-		// Extract timestamp from [ISO] prefix
-		ts := ""
-		text := line
-		if strings.HasPrefix(line, "[") {
-			if idx := strings.Index(line, "] "); idx > 0 {
-				ts = line[1:idx]
-				text = line[idx+2:]
-			}
+		var entry struct {
+			Ts   string `json:"ts"`
+			Type string `json:"type"`
+			Body string `json:"body"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			continue
+		}
+		role := "agent"
+		if entry.Type == "error" {
+			role = "system"
 		}
 		messages = append(messages, map[string]any{
-			"role":      "agent",
-			"body":      text,
-			"timestamp": ts,
-			"type":      "output",
+			"role":      role,
+			"body":      entry.Body,
+			"timestamp": entry.Ts,
+			"type":      entry.Type,
 		})
 	}
 

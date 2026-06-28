@@ -1010,6 +1010,15 @@ func buildPrompt(st *store.Store, r *Run, t *task.Task, p *project.Project, te *
 		b.WriteString(fmt.Sprintf("Project rules: %v.\n", p.Rules))
 	}
 
+	// Read project memory file (narrative + policy) if it exists.
+	// The dashboard writes this file from the memory_entries SQLite table.
+	memPath := filepath.Join(st.Root, "projects", p.ID, "memory.md")
+	if memData, err := os.ReadFile(memPath); err == nil && len(memData) > 0 {
+		b.WriteString("\n--- Project Memory ---\n")
+		b.Write(memData)
+		b.WriteString("\n")
+	}
+
 	// Only inline project docs for research/qa_review/pm_plan agents; engineering agents
 	// read the seeded files from the worktree themselves, because raw markdown (backticks,
 	// command examples) in the prompt can be misinterpreted by Hermes as executable bash.
