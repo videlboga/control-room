@@ -5,7 +5,8 @@ import {
   subscribeConversation, unsubscribeConversation,
   subscribeRun, unsubscribeRun, activeRuns,
   agentStreams, appendToStream, loadProjectAgentHistory,
-  agentRunning, setAgentRunningForKey
+  agentRunning, setAgentRunningForKey,
+  sessionMessages
 } from '../lib/stores.js'
 import { onMount, onDestroy } from 'svelte'
 
@@ -116,15 +117,26 @@ let msgs = $derived($conversation)
 // Get agent stream for current chat node
 let nodeKey = $derived(
   chat?.type === 'workspace' ? 'workspace' :
-  chat?.type === 'project' ? 'project:' + chat.id : null
+  chat?.type === 'project' ? 'project:' + chat.id : ''
 )
-let activeStream = $derived(nodeKey ? ($agentStreams[nodeKey] || []) : [])
+// Structured session messages (from state.db) — preferred over raw agentStreams
+let structuredMsgs = $derived(nodeKey ? ($sessionMessages[nodeKey] || []) : [])
+// Raw agent stream (from stdout pipe) — fallback / real-time
+let rawStreamMsgs = $derived(nodeKey ? ($agentStreams[nodeKey] || []) : [])
+// Use structured messages if available, otherwise raw stream
+let activeStream = $derived(structuredMsgs.length > 0 ? structuredMsgs : rawStreamMsgs)
 // For workspace and project: show agent stream + conversation comments (merged)
 // For other types: show conversation only
 let activeMsgs = $derived(
   (chat?.type === 'workspace' || chat?.type === 'project')
-    ? [...$conversation, ...activeStream].sort((a,b) => (a.timestamp || '').localeCompare(b.timestamp || ''))
-    : msgs
+    ? [...$conversation, ...activeStream.map(m => ({
+        role: m.role || 'agent',
+        body: m.content || m.body || '',
+        timestamp: m.timestamp || '',
+        toolName: m.toolName || m.tool_name || '',
+        toolCalls: m.toolCalls || m.tool_calls || [],
+      }))]
+    : $conversation
 )
 
 $effect(() => {
@@ -350,16 +362,45 @@ async function stopController() {
           <div class="msg-avatar">
             {#if msg.role === 'human' || msg.author === 'human'}👤
             {:else if msg.role === 'system'}⚙️
+            {:else if msg.role === 'tool'}🔧
             {:else}🤖{/if}
           </div>
           <div class="msg-content">
             <div class="msg-meta">
-              <span class="msg-author">{msg.author || msg.role}</span>
+              <span class="msg-author">{msg.toolName ? msg.toolName : (msg.author || msg.role)}</span>
               {#if msg.timestamp}
                 <span class="msg-time">{new Date(msg.timestamp).toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'})}</span>
               {/if}
             </div>
-            <div class="msg-body">{formatBody(msg)}</div>
+            {#if msg.toolCalls && msg.toolCalls.length > 0}
+              <!-- Assistant calling tools — show tool names as collapsible -->
+              <div class="tool-group" role="button" tabindex="0"
+                onclick={() => toggleGroup(gi)}
+                onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleGroup(gi) } }}>
+                <div class="tool-group-header">
+                  <span class="tool-group-icon">{expandedGroups[gi] ? '▼' : '▶'}</span>
+                  <span class="tool-group-summary">
+                    {msg.toolCalls.length} tool {msg.toolCalls.length === 1 ? 'call' : 'calls'}
+                    {#each msg.toolCalls.slice(0, 3) as tc}
+                      <span class="tool-name-badge">{tc.function?.name || tc.Function?.name || '?'}</span>
+                    {/each}
+                  </span>
+                </div>
+                {#if expandedGroups[gi]}
+                  <div class="tool-group-items">
+                    {#each msg.toolCalls as tc, tci}
+                      <div class="tool-item">
+                        <span class="tool-item-icon">🔧</span>
+                        <span class="tool-item-text">{tc.function?.name || tc.Function?.name || '?'}({(tc.function?.arguments || tc.Function?.arguments || '').substring(0, 80)})</span>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/if}
+            {#if msg.body && msg.body.trim()}
+              <div class="msg-body">{formatBody(msg)}</div>
+            {/if}
           </div>
         </div>
       {/if}
@@ -451,6 +492,7 @@ async function stopController() {
 .tool-group-icon { font-size: 10px; color: var(--text-quaternary); width: 12px; flex-shrink: 0; }
 .tool-group-summary { font-size: 11px; color: var(--text-tertiary); font-family: monospace; }
 .tool-group-first { color: var(--text-quaternary); margin-left: 6px; }
+.tool-name-badge { display: inline-block; margin-left: 4px; padding: 1px 6px; border-radius: 3px; background: rgba(99,102,241,0.15); color: #818cf8; font-size: 0.85em; }
 .tool-group-items { padding: 4px 0; background: rgba(0,0,0,0.15); }
 .tool-item { display: flex; gap: 6px; padding: 3px 10px; font-size: 11px; font-family: monospace; color: var(--text-tertiary); line-height: 1.4; }
 .tool-item-icon { flex-shrink: 0; opacity: 0.6; }

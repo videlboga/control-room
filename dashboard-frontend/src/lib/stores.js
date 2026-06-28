@@ -71,9 +71,35 @@ export const conversation = writable([])     // messages for current chat (comme
 export const controllerMessages = writable([]) // DEPRECATED — use agentStreams instead
 export const agentStreams = writable({})     // map: nodeKey → messages[] (live agent output per node)
 export const agentRunning = writable({})    // map: nodeKey → boolean (is agent running for this node)
+export const sessionMessages = writable({}) // map: nodeKey → structured messages from state.db
 
 function handleMessage(msg) {
   switch (msg.type) {
+    case 'session_message': {
+      // Structured message from SessionReader (state.db)
+      // msg: { type, id, role, content, tool_name, tool_calls, timestamp }
+      const cc = get(currentChat)
+      let nodeKey
+      if (cc.type === 'workspace') nodeKey = 'workspace'
+      else if (cc.type === 'project') nodeKey = 'project:' + cc.id
+      else break
+
+      sessionMessages.update(streams => {
+        if (!streams[nodeKey]) streams[nodeKey] = []
+        // Avoid duplicates by message ID
+        if (streams[nodeKey].some(m => m.id === msg.id)) return streams
+        streams[nodeKey] = [...streams[nodeKey], {
+          id: msg.id,
+          role: msg.role,
+          content: msg.content,
+          toolName: msg.tool_name,
+          toolCalls: msg.tool_calls,
+          timestamp: msg.timestamp,
+        }]
+        return { ...streams }
+      })
+      break
+    }
     case 'snapshot':
       activeRuns.set(msg.data.active_runs || [])
       if (Array.isArray(msg.data.task_stats)) {
@@ -397,13 +423,36 @@ export async function loadLivePreviews() {
 }
 
 export async function loadControllerHistory() {
+  // Try structured session API first (state.db), fall back to log file
+  try {
+    const data = await apiGet('/session/hw_agent_controller/latest')
+    const msgs = (data.messages || []).map(m => ({
+      id: m.ID || m.id,
+      role: m.Role || m.role || 'agent',
+      content: m.Content || m.content || '',
+      toolName: m.ToolName || m.tool_name || '',
+      toolCalls: m.ToolCalls || m.tool_calls || [],
+      timestamp: m.Timestamp || m.timestamp || '',
+    }))
+    if (msgs.length > 0) {
+      sessionMessages.update(streams => {
+        streams['workspace'] = msgs
+        return { ...streams }
+      })
+      return
+    }
+  } catch (e) { /* fall through to log-based history */ }
+
+  // Fallback: load from controller log file
   try {
     const data = await apiGet('/controller/history')
     const msgs = (data.messages || []).map(m => ({
+      id: 0,
       role: m.role || 'agent',
-      body: m.body || '',
+      content: m.body || '',
+      toolName: '',
+      toolCalls: [],
       timestamp: m.timestamp || '',
-      type: m.type || 'output',
     }))
     agentStreams.update(streams => {
       streams['workspace'] = msgs
@@ -415,17 +464,39 @@ export async function loadControllerHistory() {
 }
 
 export async function loadProjectAgentHistory(projectId) {
+  // Try structured session API first
+  try {
+    const data = await apiGet(`/session/hw_agent_project/latest`)
+    const msgs = (data.messages || []).map(m => ({
+      id: m.ID || m.id,
+      role: m.Role || m.role || 'agent',
+      content: m.Content || m.content || '',
+      toolName: m.ToolName || m.tool_name || '',
+      toolCalls: m.ToolCalls || m.tool_calls || [],
+      timestamp: m.Timestamp || m.timestamp || '',
+    }))
+    if (msgs.length > 0) {
+      sessionMessages.update(streams => {
+        streams['project:' + projectId] = msgs
+        return { ...streams }
+      })
+      return
+    }
+  } catch (e) { /* fall through */ }
+
+  // Fallback: log file
   try {
     const data = await apiGet(`/project-agent/${projectId}/history`)
     const msgs = (data.messages || []).map(m => ({
+      id: 0,
       role: m.role || 'agent',
-      body: m.body || '',
+      content: m.body || '',
+      toolName: '',
+      toolCalls: [],
       timestamp: m.timestamp || '',
-      type: m.type || 'output',
     }))
-    const key = 'project:' + projectId
     agentStreams.update(streams => {
-      streams[key] = msgs
+      streams['project:' + projectId] = msgs
       return { ...streams }
     })
   } catch (e) {

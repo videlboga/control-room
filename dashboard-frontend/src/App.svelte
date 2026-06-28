@@ -3,7 +3,7 @@ import { onMount } from 'svelte'
 import {
   connectWS, loadTree, loadConversation, loadLivePreviews,
   loadControllerHistory,
-  currentChat, controllerMessages, wsConnected
+  currentChat, controllerMessages, wsConnected, sessionMessages
 } from './lib/stores.js'
 import LivePreview from './components/LivePreview.svelte'
 import ChatView from './components/ChatView.svelte'
