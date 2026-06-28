@@ -19,17 +19,18 @@ import (
 // Unlike the controller (singleton), multiple project sessions can run
 // concurrently — one per project.
 type ProjectSession struct {
-	mu        sync.Mutex
-	id        string
-	projectID string
-	cmd       *exec.Cmd
-	stdout    io.Reader
-	stderr    io.Reader
-	sessionID string // hermes session id for --resume
-	hub       *Hub
-	done      chan struct{}
-	logFile   *os.File // session log file for persistence
-	idleSince time.Time // when the process ended (for idle timeout)
+	mu           sync.Mutex
+	id           string
+	projectID    string
+	cmd          *exec.Cmd
+	stdout       io.Reader
+	stderr       io.Reader
+	sessionID    string // hermes session id for --resume
+	hub          *Hub
+	done         chan struct{}
+	logFile      *os.File // session log file for persistence
+	idleSince    time.Time // when the process ended (for idle timeout)
+	sessionReader *SessionReader // polls state.db for structured messages
 }
 
 var (
@@ -110,12 +111,24 @@ func LaunchProjectAgent(hub *Hub, projectID, fullPrompt string) (*ProjectSession
 	// Stream stderr to WS channel.
 	go cs.streamOutput(stderrPipe, "error", channel)
 
+	// Start session reader — auto-detects latest session from state.db.
+	reader, err := NewSessionReader("hw_agent_project", channel, hub)
+	if err == nil {
+		reader.Start("") // auto-detect
+		cs.sessionReader = reader
+		slog.Info("project agent session reader started", "project", projectID)
+	}
+
 	// Wait for process to finish.
 	go func() {
 		err := cmd.Wait()
 		close(cs.done)
 		if cs.logFile != nil {
 			_ = cs.logFile.Close()
+		}
+		// Stop session reader
+		if cs.sessionReader != nil {
+			cs.sessionReader.Stop()
 		}
 		hub.BroadcastMessage(channel, map[string]any{
 			"type":   "ended",
