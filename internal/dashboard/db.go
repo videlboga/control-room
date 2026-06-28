@@ -850,6 +850,27 @@ func (db *DB) AddEvidence(nodeType, nodeID, content, source string) error {
 	return err
 }
 
+// GetBeliefs returns belief-layer entries for a node.
+func (db *DB) GetBeliefs(nodeType, nodeID string) ([]MemoryEntry, error) {
+	return db.GetMemory(nodeType, nodeID, "belief", 20)
+}
+
+// AddBelief writes a belief entry.
+func (db *DB) AddBelief(nodeType, nodeID, content, source string) error {
+	return db.AddMemorySimple(nodeType, nodeID, "belief", content, source)
+}
+
+// AddMemorySimple writes a memory entry without returning the created row.
+func (db *DB) AddMemorySimple(nodeType, nodeID, layer, content, source string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	_, err := db.db.Exec(
+		"INSERT INTO memory_entries (node_type, node_id, layer, content, source, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+		nodeType, nodeID, layer, content, source, time.Now().UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
 // GetKnowledge returns knowledge-layer entries for a node.
 func (db *DB) GetKnowledge(nodeType, nodeID string) ([]MemoryEntry, error) {
 	return db.GetMemory(nodeType, nodeID, "knowledge", 10)

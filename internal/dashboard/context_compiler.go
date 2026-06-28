@@ -8,6 +8,46 @@ import (
 	"time"
 )
 
+// humanizeEvidence converts raw JSON evidence entries into readable strings.
+// Input: {"type":"verdict_reject","run_id":"xxx","task_id":"task_123","agent":"qa","step":"verify"}
+// Output: "⚠ QA отверг задачу task_123 (verify)"
+func humanizeEvidence(raw string) string {
+	var data map[string]any
+	if err := json.Unmarshal([]byte(raw), &data); err != nil {
+		return raw // fallback to raw if not JSON
+	}
+
+	evType, _ := data["type"].(string)
+	taskID, _ := data["task_id"].(string)
+	agent, _ := data["agent"].(string)
+	step, _ := data["step"].(string)
+	reason, _ := data["reason"].(string)
+	runID, _ := data["run_id"].(string)
+
+	switch evType {
+	case "verdict_reject":
+		s := fmt.Sprintf("⚠ %s отверг задачу %s (%s)", agent, taskID, step)
+		if reason != "" {
+			s += fmt.Sprintf(" — %s", reason)
+		}
+		return s
+	case "merge_error":
+		s := fmt.Sprintf("⚠ Merge конфликт в %s (run %s)", taskID, runID)
+		if reason != "" {
+			s += fmt.Sprintf(" — %s", reason)
+		}
+		return s
+	case "run_failed":
+		s := fmt.Sprintf("⚠ Run %s упал (%s/%s)", runID, agent, step)
+		if reason != "" {
+			s += fmt.Sprintf(" — %s", reason)
+		}
+		return s
+	default:
+		return raw
+	}
+}
+
 // ─── Context Compiler ───────────────────────────────────────────────────────
 
 // CompiledContext is the output of compile_context().
@@ -22,10 +62,11 @@ type CompiledContext struct {
 	Narrative       string `json:"narrative"`         // latest narrative memory
 	Policy          string `json:"policy"`            // decisions/constraints (policy entries)
 	RawEntries      int    `json:"raw_entries"`       // count of raw memory entries
-	PreviousFailures string       `json:"previous_failures"` // recent failed runs
-	Evidence         []string     `json:"evidence"`          // notable events: merge errors, rejections
+	PreviousFailures string       `json:"previous_failures"` // recent failed runs (raw)
 	RAGChunks        []string     `json:"rag_chunks"`         // relevant doc chunks from FTS5 search
 	Knowledge        []string     `json:"knowledge"`          // cached project facts (architecture, stack)
+	Beliefs          []string     `json:"beliefs"`            // current world model: confirmed/unverified claims
+	Evidence         []string     `json:"evidence"`           // humanized evidence (readable strings)
 	OpenTasks        []TaskBrief  `json:"open_tasks"`         // tasks not done
 	Constraints      string       `json:"constraints"`        // project-level constraints
 	GeneratedAt      string       `json:"generated_at"`
@@ -138,10 +179,16 @@ func (s *Server) compileProjectContext(ctx *CompiledContext) {
 	rawEntries, _ := s.db.GetMemory("project", ctx.NodeID, "raw", 1)
 	ctx.RawEntries = len(rawEntries)
 
-	// Evidence — merge errors, rejections, failures
+	// Evidence — humanize raw JSON into readable strings
 	evidenceEntries, _ := s.db.GetEvidence("project", ctx.NodeID)
 	for _, e := range evidenceEntries {
-		ctx.Evidence = append(ctx.Evidence, e.Content)
+		ctx.Evidence = append(ctx.Evidence, humanizeEvidence(e.Content))
+	}
+
+	// Beliefs — current world model (confirmed/unverified claims)
+	beliefEntries, _ := s.db.GetBeliefs("project", ctx.NodeID)
+	for _, b := range beliefEntries {
+		ctx.Beliefs = append(ctx.Beliefs, b.Content)
 	}
 
 	// RAG — search project docs for context relevant to open tasks or project mission

@@ -566,6 +566,12 @@ func (s *Server) apiProjectAgent(w http.ResponseWriter, r *http.Request) {
 					fullPrompt += k + "\n"
 				}
 			}
+			if len(compiled.Beliefs) > 0 {
+				fullPrompt += fmt.Sprintf("\n### Current beliefs (%d)\n", len(compiled.Beliefs))
+				for _, b := range compiled.Beliefs {
+					fullPrompt += b + "\n"
+				}
+			}
 		}
 		fullPrompt += "\nОтветь на русском."
 

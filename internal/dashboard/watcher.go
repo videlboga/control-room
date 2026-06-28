@@ -458,6 +458,8 @@ func (w *Watcher) writeRawMemory(rn *run.Run, toolCount int) {
 	// Update memory.md file for the project so orchestrator's buildPrompt can read it
 	if rn.ProjectID != "" {
 		w.writeProjectMemoryFile(rn.ProjectID)
+		// Trigger belief update — async, don't block watcher
+		go w.updateBeliefs(rn.ProjectID, rn.TaskID, rn.Status, rn.Agent, rn.Step, rn.Summary)
 	}
 }
 
