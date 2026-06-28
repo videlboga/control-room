@@ -195,6 +195,13 @@ func (d *DB) createSchema() error {
 			return fmt.Errorf("schema: %w (stmt=%s)", err, firstLine(s))
 		}
 	}
+	// Init RAG FTS5 table — FTS5 columns don't support type declarations
+	d.db.Exec(`CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks USING fts5(
+		project_id,
+		source,
+		chunk_idx,
+		content,
+	 tokenize = 'porter unicode61')`)
 	return nil
 }
 
@@ -840,6 +847,26 @@ func (db *DB) GetEvidence(nodeType, nodeID string) ([]MemoryEntry, error) {
 // AddEvidence writes an evidence entry.
 func (db *DB) AddEvidence(nodeType, nodeID, content, source string) error {
 	_, err := db.AddMemory(nodeType, nodeID, "evidence", content, source)
+	return err
+}
+
+// GetKnowledge returns knowledge-layer entries for a node.
+func (db *DB) GetKnowledge(nodeType, nodeID string) ([]MemoryEntry, error) {
+	return db.GetMemory(nodeType, nodeID, "knowledge", 10)
+}
+
+// AddKnowledge writes a knowledge entry.
+func (db *DB) AddKnowledge(nodeType, nodeID, content, source string) error {
+	// Replace existing knowledge for this node (only keep latest)
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	// Delete old knowledge entries
+	_, _ = db.db.Exec("DELETE FROM memory_entries WHERE node_type = ? AND node_id = ? AND layer = 'knowledge'", nodeType, nodeID)
+	// Insert new
+	_, err := db.db.Exec(
+		"INSERT INTO memory_entries (node_type, node_id, layer, content, source, created_at) VALUES (?, ?, 'knowledge', ?, ?, ?)",
+		nodeType, nodeID, content, source, time.Now().UTC().Format(time.RFC3339),
+	)
 	return err
 }
 

@@ -24,6 +24,8 @@ type CompiledContext struct {
 	RawEntries      int    `json:"raw_entries"`       // count of raw memory entries
 	PreviousFailures string       `json:"previous_failures"` // recent failed runs
 	Evidence         []string     `json:"evidence"`          // notable events: merge errors, rejections
+	RAGChunks        []string     `json:"rag_chunks"`         // relevant doc chunks from FTS5 search
+	Knowledge        []string     `json:"knowledge"`          // cached project facts (architecture, stack)
 	OpenTasks        []TaskBrief  `json:"open_tasks"`         // tasks not done
 	Constraints      string       `json:"constraints"`        // project-level constraints
 	GeneratedAt      string       `json:"generated_at"`
@@ -140,6 +142,31 @@ func (s *Server) compileProjectContext(ctx *CompiledContext) {
 	evidenceEntries, _ := s.db.GetEvidence("project", ctx.NodeID)
 	for _, e := range evidenceEntries {
 		ctx.Evidence = append(ctx.Evidence, e.Content)
+	}
+
+	// RAG — search project docs for context relevant to open tasks or project mission
+	ragQuery := ""
+	if len(ctx.OpenTasks) > 0 {
+		ragQuery = ctx.OpenTasks[0].Title
+	} else if ctx.Mission != "" {
+		// Use first 50 chars of mission as RAG query — shorter = better recall
+		if len(ctx.Mission) > 50 {
+			ragQuery = ctx.Mission[:50]
+		} else {
+			ragQuery = ctx.Mission
+		}
+	}
+	if ragQuery != "" {
+		chunks, _ := s.db.SearchRAG(ctx.NodeID, ragQuery, 3)
+		for _, c := range chunks {
+			ctx.RAGChunks = append(ctx.RAGChunks, c.Content)
+		}
+	}
+
+	// Knowledge — cached project facts (architecture, stack, dependencies)
+	knowledgeEntries, _ := s.db.GetKnowledge("project", ctx.NodeID)
+	for _, k := range knowledgeEntries {
+		ctx.Knowledge = append(ctx.Knowledge, k.Content)
 	}
 
 	// Open tasks for this project

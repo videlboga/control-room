@@ -105,6 +105,7 @@ func (s *Server) apiMemoryAdd(w http.ResponseWriter, r *http.Request, nodeType, 
 func (s *Server) apiMemoryBriefing(w http.ResponseWriter, r *http.Request, nodeType, nodeID string) {
 	narrative, _ := s.db.GetLatestNarrative(nodeType, nodeID)
 	policy, _ := s.db.GetPolicy(nodeType, nodeID)
+	structured, _ := s.db.GetMemory(nodeType, nodeID, "structured", 10)
 
 	// For project nodes: also include project docs
 	var docs string
@@ -116,10 +117,11 @@ func (s *Server) apiMemoryBriefing(w http.ResponseWriter, r *http.Request, nodeT
 	}
 
 	jsonResponse(w, map[string]any{
-		"node_type": nodeType,
-		"node_id":   nodeID,
-		"narrative": narrative,
-		"policy":    policy,
-		"docs_dir":  docs,
+		"node_type":  nodeType,
+		"node_id":    nodeID,
+		"narrative":  narrative,
+		"policy":     policy,
+		"structured": structured,
+		"docs_dir":   docs,
 	})
 }

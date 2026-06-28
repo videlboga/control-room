@@ -549,6 +549,23 @@ func (s *Server) apiProjectAgent(w http.ResponseWriter, r *http.Request) {
 					fullPrompt += "- " + e + "\n"
 				}
 			}
+			if len(compiled.RAGChunks) > 0 {
+				fullPrompt += fmt.Sprintf("\n### Relevant docs (RAG, %d chunks)\n", len(compiled.RAGChunks))
+				for _, c := range compiled.RAGChunks {
+					// Truncate each chunk to avoid oversized prompt
+					if len(c) > 500 {
+						fullPrompt += c[:500] + "...\n"
+					} else {
+						fullPrompt += c + "\n"
+					}
+				}
+			}
+			if len(compiled.Knowledge) > 0 {
+				fullPrompt += fmt.Sprintf("\n### Knowledge (%d)\n", len(compiled.Knowledge))
+				for _, k := range compiled.Knowledge {
+					fullPrompt += k + "\n"
+				}
+			}
 		}
 		fullPrompt += "\nОтветь на русском."
 

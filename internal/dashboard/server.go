@@ -121,6 +121,9 @@ func (s *Server) routes() http.Handler {
 	// Context Compiler
 	mux.HandleFunc("/api/v1/context/", s.apiContext)
 
+	// RAG — cold memory via FTS5
+	mux.HandleFunc("/api/v1/rag/", s.apiRAG)
+
 	// Static SPA — catch-all, must be registered last.
 	mux.HandleFunc("/", s.spaHandler)
 
